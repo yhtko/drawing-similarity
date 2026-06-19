@@ -105,6 +105,22 @@ const ensureCollection = async () => {
     return false;
   }
 
+  const collectionPath = '/collections/' + encodeURIComponent(qdrantCollection);
+  const current = await fetch(qdrantUrl + collectionPath, {
+    headers: qdrantHeaders()
+  });
+
+  if (current.ok) {
+    return true;
+  }
+
+  if (current.status !== 404) {
+    const body = await current.text();
+    const error = new Error('Qdrant collection check failed: ' + current.status + ' ' + body.slice(0, 300));
+    error.status = current.status;
+    throw error;
+  }
+
   await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection), {
     method: 'PUT',
     body: JSON.stringify({
