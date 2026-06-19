@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +9,10 @@ const port = Number(process.env.PORT || 8080);
 const kintoneBaseUrl = String(process.env.KINTONE_BASE_URL || '').replace(/\/+$/, '');
 const kintoneApiToken = process.env.KINTONE_API_TOKEN || '';
 const renderDpi = Number(process.env.PDF_RENDER_DPI || 160);
+const qdrantUrl = String(process.env.QDRANT_URL || '').replace(/\/+$/, '');
+const qdrantApiKey = process.env.QDRANT_API_KEY || '';
+const qdrantCollection = process.env.QDRANT_COLLECTION || 'drawing_similarity';
+const vectorSize = Number(process.env.VECTOR_SIZE || 384);
 
 const readJson = async (request) => {
   const chunks = [];
@@ -40,6 +45,156 @@ const buildMockResults = (body) => {
       score: Number((0.92 - index * 0.035).toFixed(3))
     };
   });
+};
+
+const isQdrantConfigured = () => Boolean(qdrantUrl);
+
+const buildVector = (buffer) => {
+  const vector = [];
+  let seed = createHash('sha256').update(buffer).digest();
+
+  while (vector.length < vectorSize) {
+    seed = createHash('sha256').update(seed).digest();
+    for (const byte of seed) {
+      vector.push((byte / 127.5) - 1);
+      if (vector.length === vectorSize) {
+        break;
+      }
+    }
+  }
+
+  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
+  return vector.map((value) => Number((value / norm).toFixed(8)));
+};
+
+const qdrantHeaders = () => {
+  const headers = {
+    'Content-Type': 'application/json'
+  };
+  if (qdrantApiKey) {
+    headers['api-key'] = qdrantApiKey;
+  }
+  return headers;
+};
+
+const qdrantRequest = async (path, options = {}) => {
+  const response = await fetch(qdrantUrl + path, {
+    ...options,
+    headers: {
+      ...qdrantHeaders(),
+      ...(options.headers || {})
+    }
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    const error = new Error('Qdrant request failed: ' + response.status + ' ' + body.slice(0, 300));
+    error.status = response.status;
+    throw error;
+  }
+
+  if (response.status === 204) {
+    return {};
+  }
+
+  return response.json();
+};
+
+const ensureCollection = async () => {
+  if (!isQdrantConfigured()) {
+    return false;
+  }
+
+  await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection), {
+    method: 'PUT',
+    body: JSON.stringify({
+      vectors: {
+        size: vectorSize,
+        distance: 'Cosine'
+      }
+    })
+  });
+  return true;
+};
+
+const toPointId = (recordId) => {
+  const numeric = Number(recordId);
+  if (Number.isSafeInteger(numeric) && numeric > 0) {
+    return numeric;
+  }
+  return createHash('sha256').update(String(recordId)).digest('hex').slice(0, 32);
+};
+
+const upsertDrawing = async (body, vector) => {
+  if (!isQdrantConfigured()) {
+    return { configured: false, upserted: false };
+  }
+
+  await ensureCollection();
+  await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points?wait=true', {
+    method: 'PUT',
+    body: JSON.stringify({
+      points: [
+        {
+          id: toPointId(body.recordId),
+          vector,
+          payload: {
+            tenant_id: body.tenantId || 'default',
+            record_id: String(body.recordId),
+            app_id: body.appId ? String(body.appId) : '',
+            drawing_no: body.drawingNo || '',
+            product_name: body.productName || '',
+            file_name: body.fileName || ''
+          }
+        }
+      ]
+    })
+  });
+
+  return {
+    configured: true,
+    upserted: true,
+    collection: qdrantCollection,
+    vectorSize
+  };
+};
+
+const searchDrawings = async (body, vector) => {
+  if (!isQdrantConfigured()) {
+    return null;
+  }
+
+  await ensureCollection();
+  const limit = Math.min(Number(body.limit || 10) + 1, 25);
+  const data = await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points/search', {
+    method: 'POST',
+    body: JSON.stringify({
+      vector,
+      limit,
+      with_payload: true,
+      filter: {
+        must: [
+          {
+            key: 'tenant_id',
+            match: {
+              value: body.tenantId || 'default'
+            }
+          }
+        ]
+      }
+    })
+  });
+
+  return (data.result || [])
+    .filter((item) => String(item.payload?.record_id || '') !== String(body.recordId || ''))
+    .slice(0, Math.min(Number(body.limit || 10), 10))
+    .map((item) => ({
+      recordId: item.payload?.record_id || item.id,
+      drawingNo: item.payload?.drawing_no || 'record ' + item.id,
+      productName: item.payload?.product_name || '',
+      customer: item.payload?.file_name || '',
+      score: Number(item.score || 0)
+    }));
 };
 
 const assertKintoneConfig = () => {
@@ -115,6 +270,23 @@ const convertPdfFirstPageToPng = async (pdfBuffer) => {
   }
 };
 
+const loadRecordImage = async (body) => {
+  if (!body.recordId) {
+    const error = new Error('recordId is required');
+    error.status = 400;
+    throw error;
+  }
+  if (!body.fileKey) {
+    const error = new Error('fileKey is required');
+    error.status = 400;
+    throw error;
+  }
+
+  const pdfBuffer = await fetchKintoneFile(body.fileKey);
+  const pngBuffer = await convertPdfFirstPageToPng(pdfBuffer);
+  return { pdfBuffer, pngBuffer };
+};
+
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || '/', 'http://localhost');
 
@@ -131,6 +303,26 @@ const server = createServer(async (request, response) => {
   if (request.method === 'POST' && url.pathname === '/similar') {
     try {
       const body = await readJson(request);
+      if (isQdrantConfigured() && body.fileKey) {
+        const { pngBuffer } = await loadRecordImage(body);
+        const results = await searchDrawings(body, buildVector(pngBuffer));
+        sendJson(response, 200, {
+          mode: 'qdrant-dummy-vector',
+          query: {
+            tenantId: body.tenantId || 'default',
+            appId: body.appId,
+            recordId: body.recordId,
+            drawingNo: body.drawingNo || ''
+          },
+          qdrant: {
+            collection: qdrantCollection,
+            vectorSize
+          },
+          results
+        });
+        return;
+      }
+
       sendJson(response, 200, {
         mode: 'mock',
         query: {
@@ -150,20 +342,12 @@ const server = createServer(async (request, response) => {
   if (request.method === 'POST' && url.pathname === '/index') {
     try {
       const body = await readJson(request);
-      if (!body.recordId) {
-        sendJson(response, 400, { error: 'recordId is required' });
-        return;
-      }
-      if (!body.fileKey) {
-        sendJson(response, 400, { error: 'fileKey is required' });
-        return;
-      }
-
-      const pdfBuffer = await fetchKintoneFile(body.fileKey);
-      const pngBuffer = await convertPdfFirstPageToPng(pdfBuffer);
+      const { pdfBuffer, pngBuffer } = await loadRecordImage(body);
+      const vector = buildVector(pngBuffer);
+      const qdrant = await upsertDrawing(body, vector);
 
       sendJson(response, 202, {
-        mode: 'pdf-ready',
+        mode: qdrant.upserted ? 'qdrant-dummy-vector' : 'pdf-ready',
         accepted: true,
         tenantId: body.tenantId || 'default',
         appId: body.appId || null,
@@ -181,7 +365,14 @@ const server = createServer(async (request, response) => {
           bytes: pngBuffer.length,
           widthHint: Math.round(8.27 * renderDpi)
         },
-        next: 'OpenCLIP embedding and Qdrant upsert are not implemented yet.'
+        vector: {
+          provider: 'sha256-dummy',
+          size: vector.length
+        },
+        qdrant,
+        next: qdrant.upserted
+          ? 'Replace the sha256 dummy vector with an OpenCLIP embedding.'
+          : 'Set QDRANT_URL to enable vector upsert.'
       });
     } catch (error) {
       sendJson(response, error.status || 500, { error: error.message });

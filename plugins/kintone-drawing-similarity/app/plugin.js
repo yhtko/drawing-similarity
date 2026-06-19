@@ -141,9 +141,12 @@
           throw new Error(data.error || 'API returned ' + response.status);
         }
 
+        const qdrantStatus = data.qdrant && data.qdrant.upserted
+          ? ' / Qdrant登録済み'
+          : ' / Qdrant未設定';
         setStatus(
           panel,
-          '登録準備が完了しました: ' + data.fileName + ' / ' + data.image.widthHint + 'px相当 / ' + data.image.bytes + ' bytes'
+          '登録準備が完了しました: ' + data.fileName + ' / ' + data.image.widthHint + 'px相当 / ' + data.image.bytes + ' bytes' + qdrantStatus
         );
       } catch (error) {
         setStatus(panel, '図面登録に失敗しました: ' + error.message);
