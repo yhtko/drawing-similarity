@@ -14,6 +14,14 @@ Run locally:
 npm start
 ```
 
+Required environment variables for real kintone PDF download:
+
+```sh
+KINTONE_BASE_URL=https://example.kintone.com
+KINTONE_API_TOKEN=your-api-token
+PDF_RENDER_DPI=160
+```
+
 Example request:
 
 ```sh
@@ -24,7 +32,6 @@ curl -X POST http://localhost:8080/similar \
 
 Next implementation step:
 
-1. Fetch the PDF from kintone by file key.
-2. Convert the first page, or selected pages, to images.
-3. Generate image embeddings with OpenCLIP.
-4. Upsert and query Qdrant with `tenant_id` and `record_id` payloads.
+1. Generate image embeddings with OpenCLIP.
+2. Upsert and query Qdrant with `tenant_id` and `record_id` payloads.
+3. Replace the mock `/similar` response with Qdrant search results.

@@ -66,10 +66,17 @@
 
 .pb-similarity-button {
   min-height: 36px;
+  margin-left: 8px;
   border: 1px solid #1769aa;
   border-radius: 6px;
   background: #1769aa;
   color: #ffffff;
   cursor: pointer;
   font-weight: 700;
+}
+
+.pb-similarity-button.secondary {
+  border-color: #728191;
+  background: #ffffff;
+  color: #1f2933;
 }

@@ -12,6 +12,28 @@
     return record[fieldCode].value || '';
   };
 
+  const getFirstFile = (record, fieldCode) => {
+    const value = getFieldValue(record, fieldCode);
+    if (!Array.isArray(value) || !value.length) {
+      return null;
+    }
+    return value[0];
+  };
+
+  const buildRecordPayload = (event, config) => {
+    const file = getFirstFile(event.record, config.pdfFileField);
+    return {
+      appId: kintone.app.getId(),
+      recordId: event.recordId,
+      tenantId: config.tenantId || 'default',
+      drawingNo: getFieldValue(event.record, config.drawingNoField),
+      productName: getFieldValue(event.record, config.productNameField),
+      fileKey: file ? file.fileKey : '',
+      fileName: file ? file.name : '',
+      limit: 10
+    };
+  };
+
   const setStatus = (panel, message) => {
     const status = panel.querySelector('.pb-similarity-status');
     status.textContent = message;
@@ -75,14 +97,60 @@
     const config = kintone.plugin.app.getConfig(PLUGIN_ID);
     const apiBaseUrl = normalizeBaseUrl(config.apiBaseUrl);
     const header = kintone.app.record.getHeaderMenuSpaceElement();
+    const indexButton = document.createElement('button');
+    indexButton.id = 'pb-similarity-index';
+    indexButton.className = 'pb-similarity-button secondary';
+    indexButton.type = 'button';
+    indexButton.textContent = '図面を登録/更新';
+
     const button = document.createElement('button');
     button.id = 'pb-similarity-search';
     button.className = 'pb-similarity-button';
     button.type = 'button';
     button.textContent = '類似図面検索';
-    header.appendChild(button);
+    header.append(indexButton, button);
 
     const panel = createPanel(button);
+
+    indexButton.addEventListener('click', async () => {
+      if (!apiBaseUrl) {
+        setStatus(panel, 'プラグイン設定でAPI Base URLを設定してください。');
+        return;
+      }
+
+      const payload = buildRecordPayload(event, config);
+      if (!payload.fileKey) {
+        setStatus(panel, 'PDFファイルフィールドにファイルが見つかりません。');
+        return;
+      }
+
+      indexButton.disabled = true;
+      setStatus(panel, 'PDFを取得して画像化しています...');
+
+      try {
+        const response = await fetch(apiBaseUrl + '/index', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'API returned ' + response.status);
+        }
+
+        setStatus(
+          panel,
+          '登録準備が完了しました: ' + data.fileName + ' / ' + data.image.widthHint + 'px相当 / ' + data.image.bytes + ' bytes'
+        );
+      } catch (error) {
+        setStatus(panel, '図面登録に失敗しました: ' + error.message);
+      } finally {
+        indexButton.disabled = false;
+      }
+    });
 
     button.addEventListener('click', async () => {
       if (!apiBaseUrl) {
@@ -99,14 +167,7 @@
           headers: {
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({
-            appId: kintone.app.getId(),
-            recordId: event.recordId,
-            tenantId: config.tenantId || 'default',
-            drawingNo: getFieldValue(event.record, config.drawingNoField),
-            productName: getFieldValue(event.record, config.productNameField),
-            limit: 10
-          })
+          body: JSON.stringify(buildRecordPayload(event, config))
         });
 
         if (!response.ok) {
