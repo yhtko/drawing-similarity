@@ -36,6 +36,19 @@ const sendJson = (response, status, payload) => {
   response.end(JSON.stringify(payload));
 };
 
+const getRuntimeInfo = () => ({
+  embeddingProvider,
+  qdrantConfigured: isQdrantConfigured(),
+  qdrantCollection,
+  dummyVectorSize,
+  openclip: {
+    model: process.env.OPENCLIP_MODEL || 'ViT-B-32',
+    pretrained: process.env.OPENCLIP_PRETRAINED || 'laion2b_s34b_b79k',
+    device: process.env.OPENCLIP_DEVICE || 'auto'
+  },
+  renderDpi
+});
+
 const buildMockResults = (body) => {
   const base = Number(body.recordId || 1000);
   return Array.from({ length: Math.min(Number(body.limit || 10), 10) }, (_, index) => {
@@ -408,7 +421,11 @@ const server = createServer(async (request, response) => {
   }
 
   if (request.method === 'GET' && url.pathname === '/health') {
-    sendJson(response, 200, { ok: true, service: 'drawing-similarity-api' });
+    sendJson(response, 200, {
+      ok: true,
+      service: 'drawing-similarity-api',
+      runtime: getRuntimeInfo()
+    });
     return;
   }
 

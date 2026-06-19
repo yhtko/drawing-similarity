@@ -149,9 +149,18 @@
         const qdrantStatus = data.qdrant && data.qdrant.upserted
           ? ' / Qdrant登録済み'
           : ' / Qdrant未設定';
+        const vectorStatus = data.vector
+          ? ' / ' + data.vector.provider + ' ' + data.vector.size + 'd'
+          : '';
+        const collectionStatus = data.qdrant && data.qdrant.collection
+          ? ' / ' + data.qdrant.collection
+          : '';
+        const recordStatus = data.recordId
+          ? ' / record ' + data.recordId
+          : '';
         setStatus(
           panel,
-          '登録準備が完了しました: ' + data.fileName + ' / ' + data.image.widthHint + 'px相当 / ' + data.image.bytes + ' bytes' + qdrantStatus
+          '登録準備が完了しました: ' + data.fileName + ' / ' + data.image.widthHint + 'px相当 / ' + data.image.bytes + ' bytes' + qdrantStatus + vectorStatus + collectionStatus + recordStatus
         );
       } catch (error) {
         setStatus(panel, '図面登録に失敗しました: ' + error.message);
