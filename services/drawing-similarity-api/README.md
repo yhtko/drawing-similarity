@@ -31,7 +31,24 @@ QDRANT_COLLECTION=drawing_similarity
 VECTOR_SIZE=384
 ```
 
-The current vector is a deterministic SHA-256 based dummy vector generated from the rendered PNG. This is only for validating Cloud Run to Qdrant wiring. Replace `buildVector` with OpenCLIP embeddings before judging search quality.
+Optional environment variables for OpenCLIP:
+
+```sh
+EMBEDDING_PROVIDER=openclip
+OPENCLIP_MODEL=ViT-B-32
+OPENCLIP_PRETRAINED=laion2b_s34b_b79k
+OPENCLIP_DEVICE=cpu
+```
+
+The default vector is a deterministic SHA-256 based dummy vector generated from the rendered PNG. This is only for validating Cloud Run to Qdrant wiring.
+
+When `EMBEDDING_PROVIDER=openclip` is set, the Node API calls `embed_openclip.py`, which uses OpenCLIP to generate normalized image embeddings. `ViT-B-32` embeddings are 512-dimensional, so use a fresh collection such as:
+
+```sh
+QDRANT_COLLECTION=drawing_similarity_openclip
+```
+
+If an existing collection has a different vector size, the API returns a clear mismatch error instead of upserting incompatible vectors.
 
 Example request:
 
@@ -43,6 +60,7 @@ curl -X POST http://localhost:8080/similar \
 
 Next implementation step:
 
-1. Deploy with Qdrant environment variables.
-2. Register several drawings from kintone and confirm points are created in Qdrant.
-3. Replace the SHA-256 dummy vector with OpenCLIP embeddings.
+1. Deploy with `EMBEDDING_PROVIDER=openclip`.
+2. Use a new OpenCLIP Qdrant collection.
+3. Register 100-300 drawings from kintone.
+4. Run similarity search and judge whether the results feel visually similar.

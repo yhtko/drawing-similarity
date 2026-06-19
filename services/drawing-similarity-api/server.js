@@ -12,7 +12,10 @@ const renderDpi = Number(process.env.PDF_RENDER_DPI || 160);
 const qdrantUrl = String(process.env.QDRANT_URL || '').replace(/\/+$/, '');
 const qdrantApiKey = process.env.QDRANT_API_KEY || '';
 const qdrantCollection = process.env.QDRANT_COLLECTION || 'drawing_similarity';
-const vectorSize = Number(process.env.VECTOR_SIZE || 384);
+const dummyVectorSize = Number(process.env.VECTOR_SIZE || 384);
+const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'dummy';
+const pythonBin = process.env.PYTHON_BIN || 'python';
+const openClipScript = process.env.OPENCLIP_SCRIPT || join(process.cwd(), 'embed_openclip.py');
 
 const readJson = async (request) => {
   const chunks = [];
@@ -53,11 +56,11 @@ const buildVector = (buffer) => {
   const vector = [];
   let seed = createHash('sha256').update(buffer).digest();
 
-  while (vector.length < vectorSize) {
+  while (vector.length < dummyVectorSize) {
     seed = createHash('sha256').update(seed).digest();
     for (const byte of seed) {
       vector.push((byte / 127.5) - 1);
-      if (vector.length === vectorSize) {
+      if (vector.length === dummyVectorSize) {
         break;
       }
     }
@@ -65,6 +68,73 @@ const buildVector = (buffer) => {
 
   const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
   return vector.map((value) => Number((value / norm).toFixed(8)));
+};
+
+const runJsonCommand = (command, args, options = {}) => new Promise((resolve, reject) => {
+  const child = spawn(command, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...options
+  });
+  const stdout = [];
+  const stderr = [];
+
+  child.stdout.on('data', (chunk) => {
+    stdout.push(chunk);
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr.push(chunk);
+  });
+
+  child.on('error', reject);
+  child.on('close', (code) => {
+    const output = Buffer.concat(stdout).toString('utf8');
+    if (code !== 0) {
+      reject(new Error(command + ' exited with ' + code + ': ' + Buffer.concat(stderr).toString('utf8')));
+      return;
+    }
+
+    try {
+      resolve(JSON.parse(output));
+    } catch (error) {
+      reject(new Error('Failed to parse ' + command + ' JSON output: ' + error.message + ' output=' + output.slice(0, 300)));
+    }
+  });
+});
+
+const buildOpenClipVector = async (buffer) => {
+  const workDir = await mkdtemp(join(tmpdir(), 'drawing-embedding-'));
+  const imagePath = join(workDir, 'page.png');
+
+  try {
+    await writeFile(imagePath, buffer);
+    const data = await runJsonCommand(pythonBin, [openClipScript, imagePath], {
+      env: process.env
+    });
+    if (!Array.isArray(data.vector) || !data.vector.length) {
+      throw new Error('OpenCLIP returned an empty vector');
+    }
+    return {
+      provider: data.provider || 'openclip',
+      model: data.model || '',
+      pretrained: data.pretrained || '',
+      vector: data.vector
+    };
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+};
+
+const buildEmbedding = async (buffer) => {
+  if (embeddingProvider === 'openclip') {
+    return buildOpenClipVector(buffer);
+  }
+
+  return {
+    provider: 'sha256-dummy',
+    model: '',
+    pretrained: '',
+    vector: buildVector(buffer)
+  };
 };
 
 const qdrantHeaders = () => {
@@ -100,7 +170,21 @@ const qdrantRequest = async (path, options = {}) => {
   return response.json();
 };
 
-const ensureCollection = async () => {
+const getCollectionVectorSize = (data) => {
+  const vectors = data?.result?.config?.params?.vectors;
+  if (!vectors) {
+    return null;
+  }
+  if (typeof vectors.size === 'number') {
+    return vectors.size;
+  }
+  if (vectors.default && typeof vectors.default.size === 'number') {
+    return vectors.default.size;
+  }
+  return null;
+};
+
+const ensureCollection = async (size) => {
   if (!isQdrantConfigured()) {
     return false;
   }
@@ -111,6 +195,18 @@ const ensureCollection = async () => {
   });
 
   if (current.ok) {
+    const data = await current.json();
+    const currentSize = getCollectionVectorSize(data);
+    if (currentSize && currentSize !== size) {
+      const error = new Error(
+        'Qdrant collection vector size mismatch: collection=' + qdrantCollection +
+        ' current=' + currentSize +
+        ' requested=' + size +
+        '. Use a new QDRANT_COLLECTION or recreate the collection.'
+      );
+      error.status = 409;
+      throw error;
+    }
     return true;
   }
 
@@ -125,7 +221,7 @@ const ensureCollection = async () => {
     method: 'PUT',
     body: JSON.stringify({
       vectors: {
-        size: vectorSize,
+        size,
         distance: 'Cosine'
       }
     })
@@ -146,7 +242,7 @@ const upsertDrawing = async (body, vector) => {
     return { configured: false, upserted: false };
   }
 
-  await ensureCollection();
+  await ensureCollection(vector.length);
   await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points?wait=true', {
     method: 'PUT',
     body: JSON.stringify({
@@ -171,7 +267,7 @@ const upsertDrawing = async (body, vector) => {
     configured: true,
     upserted: true,
     collection: qdrantCollection,
-    vectorSize
+    vectorSize: vector.length
   };
 };
 
@@ -180,7 +276,7 @@ const searchDrawings = async (body, vector) => {
     return null;
   }
 
-  await ensureCollection();
+  await ensureCollection(vector.length);
   const limit = Math.min(Number(body.limit || 10) + 1, 25);
   const data = await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points/search', {
     method: 'POST',
@@ -321,9 +417,10 @@ const server = createServer(async (request, response) => {
       const body = await readJson(request);
       if (isQdrantConfigured() && body.fileKey) {
         const { pngBuffer } = await loadRecordImage(body);
-        const results = await searchDrawings(body, buildVector(pngBuffer));
+        const embedding = await buildEmbedding(pngBuffer);
+        const results = await searchDrawings(body, embedding.vector);
         sendJson(response, 200, {
-          mode: 'qdrant-dummy-vector',
+          mode: 'qdrant-' + embedding.provider,
           query: {
             tenantId: body.tenantId || 'default',
             appId: body.appId,
@@ -332,7 +429,7 @@ const server = createServer(async (request, response) => {
           },
           qdrant: {
             collection: qdrantCollection,
-            vectorSize
+            vectorSize: embedding.vector.length
           },
           results
         });
@@ -350,7 +447,7 @@ const server = createServer(async (request, response) => {
         results: buildMockResults(body)
       });
     } catch (error) {
-      sendJson(response, 400, { error: error.message });
+      sendJson(response, error.status || 500, { error: error.message });
     }
     return;
   }
@@ -359,11 +456,11 @@ const server = createServer(async (request, response) => {
     try {
       const body = await readJson(request);
       const { pdfBuffer, pngBuffer } = await loadRecordImage(body);
-      const vector = buildVector(pngBuffer);
-      const qdrant = await upsertDrawing(body, vector);
+      const embedding = await buildEmbedding(pngBuffer);
+      const qdrant = await upsertDrawing(body, embedding.vector);
 
       sendJson(response, 202, {
-        mode: qdrant.upserted ? 'qdrant-dummy-vector' : 'pdf-ready',
+        mode: qdrant.upserted ? 'qdrant-' + embedding.provider : 'pdf-ready',
         accepted: true,
         tenantId: body.tenantId || 'default',
         appId: body.appId || null,
@@ -382,12 +479,18 @@ const server = createServer(async (request, response) => {
           widthHint: Math.round(8.27 * renderDpi)
         },
         vector: {
-          provider: 'sha256-dummy',
-          size: vector.length
+          provider: embedding.provider,
+          model: embedding.model,
+          pretrained: embedding.pretrained,
+          size: embedding.vector.length
         },
         qdrant,
         next: qdrant.upserted
-          ? 'Replace the sha256 dummy vector with an OpenCLIP embedding.'
+          ? (
+            embedding.provider === 'sha256-dummy'
+              ? 'Set EMBEDDING_PROVIDER=openclip to use OpenCLIP embeddings.'
+              : 'OpenCLIP embedding was stored. Register more drawings and run similarity search.'
+          )
           : 'Set QDRANT_URL to enable vector upsert.'
       });
     } catch (error) {
