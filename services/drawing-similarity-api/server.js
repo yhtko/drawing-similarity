@@ -16,6 +16,7 @@ const dummyVectorSize = Number(process.env.VECTOR_SIZE || 384);
 const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'dummy';
 const pythonBin = process.env.PYTHON_BIN || 'python';
 const openClipScript = process.env.OPENCLIP_SCRIPT || join(process.cwd(), 'embed_openclip.py');
+let payloadIndexesReady = false;
 
 const readJson = async (request) => {
   const chunks = [];
@@ -220,6 +221,7 @@ const ensureCollection = async (size) => {
       error.status = 409;
       throw error;
     }
+    await ensurePayloadIndexes();
     return true;
   }
 
@@ -239,6 +241,33 @@ const ensureCollection = async (size) => {
       }
     })
   });
+  await ensurePayloadIndexes();
+  return true;
+};
+
+const ensurePayloadIndexes = async () => {
+  if (!isQdrantConfigured()) {
+    return false;
+  }
+  if (payloadIndexesReady) {
+    return true;
+  }
+
+  try {
+    await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/index', {
+      method: 'PUT',
+      body: JSON.stringify({
+        field_name: 'tenant_id',
+        field_schema: 'keyword'
+      })
+    });
+  } catch (error) {
+    if (error.status !== 409) {
+      throw error;
+    }
+  }
+
+  payloadIndexesReady = true;
   return true;
 };
 
