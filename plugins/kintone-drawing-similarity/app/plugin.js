@@ -76,6 +76,7 @@
 
   const createPanel = (button) => {
     const panel = document.createElement('section');
+    panel.id = 'pb-similarity-panel';
     panel.className = 'pb-similarity-panel';
     panel.innerHTML = [
       '<div class="pb-similarity-header">',
@@ -89,10 +90,14 @@
     return panel;
   };
 
+  const clearPluginUi = () => {
+    document.querySelectorAll('#pb-similarity-index, #pb-similarity-search, #pb-similarity-panel, .pb-similarity-panel').forEach((element) => {
+      element.remove();
+    });
+  };
+
   kintone.events.on('app.record.detail.show', (event) => {
-    if (document.getElementById('pb-similarity-search')) {
-      return event;
-    }
+    clearPluginUi();
 
     const config = kintone.plugin.app.getConfig(PLUGIN_ID);
     const apiBaseUrl = normalizeBaseUrl(config.apiBaseUrl);
