@@ -1,0 +1,28 @@
+{
+  "manifest_version": 1,
+  "version": "0.1.0",
+  "type": "APP",
+  "name": {
+    "ja": "類似図面検索",
+    "en": "Drawing Similarity Search"
+  },
+  "description": {
+    "ja": "kintoneの図面レコードから類似図面検索APIを呼び出し、候補を表示します。",
+    "en": "Calls a drawing similarity API from kintone drawing records and displays candidates."
+  },
+  "icon": "images/icon.png",
+  "homepage_url": {
+    "ja": "https://plugbits.app/",
+    "en": "https://plugbits.app/"
+  },
+  "desktop": {
+    "js": ["app/plugin.js"],
+    "css": ["app/plugin.css"]
+  },
+  "config": {
+    "html": "config/config.html",
+    "js": ["config/config.js"],
+    "css": ["config/config.css"],
+    "required_params": ["apiBaseUrl"]
+  }
+}
