@@ -22,6 +22,14 @@ const dummyVectorSize = expectedVectorSize;
 const pythonBin = process.env.PYTHON_BIN || 'python';
 const openClipScript = process.env.OPENCLIP_SCRIPT || join(process.cwd(), 'embed_openclip.py');
 const embeddingImageMode = String(process.env.EMBED_IMAGE_MODE || 'full').toLowerCase();
+const defaultOcrEngine = process.env.NODE_ENV === 'production' ? 'tesseract' : 'none';
+const ocrEngine = String(process.env.OCR_ENGINE || defaultOcrEngine).toLowerCase();
+const ocrLangs = String(process.env.OCR_LANGS || 'eng').trim();
+const tesseractBin = process.env.TESSERACT_BIN || 'tesseract';
+const configuredOcrTimeoutMs = Number(process.env.OCR_TIMEOUT_MS || 120000);
+const ocrTimeoutMs = Number.isFinite(configuredOcrTimeoutMs) && configuredOcrTimeoutMs > 0
+  ? configuredOcrTimeoutMs
+  : 120000;
 const configuredOpenClipTimeoutMs = Number(process.env.OPENCLIP_TIMEOUT_MS || 180000);
 const openClipTimeoutMs = Number.isFinite(configuredOpenClipTimeoutMs) && configuredOpenClipTimeoutMs > 0
   ? configuredOpenClipTimeoutMs
@@ -89,7 +97,12 @@ const getRuntimeInfo = () => ({
   openclipScript: openClipScript,
   openclipDevice: process.env.OPENCLIP_DEVICE || 'auto',
   openclipTimeoutMs: openClipTimeoutMs,
+  ocrEngine,
+  ocrLangs,
+  tesseractBin,
+  ocrTimeoutMs,
   timeout: {
+    ocrMs: ocrTimeoutMs,
     openclipMs: openClipTimeoutMs
   },
   nodeVersion: process.version,
@@ -226,6 +239,89 @@ const runJsonCommand = (command, args, options = {}) => new Promise((resolve, re
   });
 });
 
+const runTextCommand = (command, args, options = {}) => new Promise((resolve, reject) => {
+  const {
+    log = null,
+    errorLog = null,
+    logLabel = 'command',
+    step = 'command',
+    timeoutMs = 0,
+    timeoutMessage = command + ' timed out',
+    ...spawnOptions
+  } = options;
+  const child = spawn(command, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...spawnOptions
+  });
+  const stdout = [];
+  const stderr = [];
+  let settled = false;
+  let timedOut = false;
+  let timeoutId = null;
+
+  if (log) {
+    log(logLabel + ' spawn start', { command, timeoutMs });
+  }
+
+  const settle = (callback, value) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    callback(value);
+  };
+
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      if (errorLog) {
+        errorLog(logLabel + ' timeout', { timeoutMs });
+      }
+      child.kill('SIGKILL');
+    }, timeoutMs);
+  }
+
+  child.stdout.on('data', (chunk) => {
+    stdout.push(chunk);
+    if (log) {
+      log(logLabel + ' stdout received', { bytes: chunk.length });
+    }
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr.push(chunk);
+    if (errorLog) {
+      errorLog(logLabel + ' stderr received', {
+        bytes: chunk.length,
+        text: chunk.toString('utf8')
+      });
+    }
+  });
+
+  child.on('error', (error) => {
+    if (errorLog) {
+      errorLog(logLabel + ' spawn error', { error: error.message });
+    }
+    settle(reject, attachStep(error, step));
+  });
+  child.on('close', (code) => {
+    if (log) {
+      log(logLabel + ' exit code=' + code);
+    }
+    if (timedOut) {
+      settle(reject, createStepError(timeoutMessage, step, 504, { timeoutMs }));
+      return;
+    }
+    if (code !== 0) {
+      settle(reject, createStepError(command + ' exited with ' + code + ': ' + Buffer.concat(stderr).toString('utf8'), step));
+      return;
+    }
+    settle(resolve, Buffer.concat(stdout).toString('utf8'));
+  });
+});
+
 const buildOpenClipVector = async (buffer, context = {}) => {
   const workDir = await mkdtemp(join(tmpdir(), 'drawing-embedding-'));
   const imagePath = join(workDir, 'page.png');
@@ -255,6 +351,46 @@ const buildOpenClipVector = async (buffer, context = {}) => {
       imageMode: data.image_mode || embeddingImageMode,
       image: data.image || null,
       vector: data.vector
+    };
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+};
+
+const buildOcrText = async (pngBuffer, context = {}) => {
+  if (ocrEngine === 'none') {
+    return {
+      engine: 'none',
+      langs: '',
+      text: '',
+      imagePath: ''
+    };
+  }
+  if (ocrEngine !== 'tesseract') {
+    const error = new Error('Unsupported OCR_ENGINE: ' + ocrEngine);
+    error.status = 500;
+    throw error;
+  }
+
+  const workDir = await mkdtemp(join(tmpdir(), 'drawing-ocr-'));
+  const imagePath = join(workDir, 'page.png');
+
+  try {
+    await writeFile(imagePath, pngBuffer);
+    const text = await runTextCommand(tesseractBin, [imagePath, 'stdout', '--oem', '1', '--psm', '6', '-l', ocrLangs], {
+      env: process.env,
+      log: context.log,
+      errorLog: context.errorLog,
+      logLabel: 'tesseract',
+      step: 'ocr',
+      timeoutMs: ocrTimeoutMs,
+      timeoutMessage: 'OCR timed out'
+    });
+    return {
+      engine: 'tesseract',
+      langs: ocrLangs,
+      text: String(text || '').replace(/\u0000/g, '').trim(),
+      imagePath
     };
   } finally {
     await rm(workDir, { recursive: true, force: true });
@@ -486,6 +622,9 @@ const upsertDrawing = async (body, embedding, context = {}) => {
               file_name: body.fileName || '',
               file_key: body.fileKey || '',
               indexed_at: new Date().toISOString(),
+              ocr_engine: context.ocr?.engine || 'none',
+              ocr_langs: context.ocr?.langs || '',
+              ocr_text: context.ocr?.text || '',
               embedding_provider: embedding.provider,
               embedding_model: embedding.model || '',
               embedding_pretrained: embedding.pretrained || '',
@@ -793,6 +932,29 @@ const server = createServer(async (request, response) => {
         bytes: pngBuffer.length
       });
 
+      step = 'ocr';
+      indexLog('ocr start', {
+        engine: ocrEngine,
+        langs: ocrLangs
+      });
+      const ocr = await buildOcrText(pngBuffer, {
+        log: indexLog,
+        errorLog: indexError
+      }).catch((error) => {
+        if (ocrEngine === 'none') {
+          return {
+            engine: 'none',
+            langs: '',
+            text: ''
+          };
+        }
+        throw attachStep(error, step);
+      });
+      indexLog('ocr done', {
+        engine: ocr.engine,
+        textLength: ocr.text.length
+      });
+
       step = 'embedding';
       indexLog('embedding start', {
         provider: embeddingProvider,
@@ -813,7 +975,8 @@ const server = createServer(async (request, response) => {
       step = 'qdrant_upsert';
       const qdrant = await upsertDrawing(body, embedding, {
         log: indexLog,
-        errorLog: indexError
+        errorLog: indexError,
+        ocr
       });
 
       sendJson(response, 202, {
@@ -826,6 +989,11 @@ const server = createServer(async (request, response) => {
         drawingNo: body.drawingNo || '',
         productName: body.productName || '',
         fileName: body.fileName || '',
+        ocr: {
+          engine: ocr.engine,
+          langs: ocr.langs,
+          textLength: ocr.text.length
+        },
         pdf: {
           bytes: pdfBuffer.length
         },

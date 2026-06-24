@@ -5,7 +5,7 @@ Minimal Cloud Run API scaffold for the kintone drawing similarity PoC.
 Current endpoints:
 
 - `GET /health`
-- `POST /index`: downloads the kintone PDF, renders page 1 to PNG, creates a deterministic dummy vector, and upserts to Qdrant when configured.
+- `POST /index`: downloads the kintone PDF, renders page 1 to PNG, extracts OCR text, creates an embedding, and upserts to Qdrant when configured.
 - `POST /similar`: searches Qdrant with the already indexed record vector when available. If the record is not indexed yet and `fileKey` is supplied, it falls back to downloading the PDF, rendering page 1, and generating a query vector. Otherwise it returns mock results.
 
 Run locally:
@@ -41,6 +41,15 @@ OPENCLIP_PRETRAINED=laion2b_s34b_b79k
 OPENCLIP_DEVICE=cpu
 EMBED_IMAGE_MODE=center_crop
 VECTOR_SIZE=512
+```
+
+OCR is enabled by default in production:
+
+```sh
+OCR_ENGINE=tesseract
+OCR_LANGS=eng
+OCR_TIMEOUT_MS=120000
+TESSERACT_BIN=tesseract
 ```
 
 `EMBED_IMAGE_MODE` controls the image sent to the embedding provider:
