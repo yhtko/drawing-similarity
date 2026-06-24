@@ -39,7 +39,7 @@ EMBEDDING_PROVIDER=openclip
 OPENCLIP_MODEL=ViT-B-32
 OPENCLIP_PRETRAINED=laion2b_s34b_b79k
 OPENCLIP_DEVICE=cpu
-EMBED_IMAGE_MODE=center_crop
+EMBED_IMAGE_MODE=auto_roi
 VECTOR_SIZE=512
 ```
 
@@ -97,8 +97,15 @@ Use `scoreBreakdown.vectorRaw` to inspect the original Qdrant score. If most `ve
 
 - `full`: use the full rendered first page.
 - `center_crop`: crop the rendered image to x 5%-85% and y 10%-80% before OpenCLIP embedding.
+- `auto_roi`: estimate the main drawing region by removing dominant ruling lines and scoring connected line components.
 
-When changing `EMBED_IMAGE_MODE`, re-index the target drawings before judging similarity results. The mode is stored in Qdrant payload as `embedding_image_mode`.
+`SHAPE_IMAGE_MODE` controls the image used for shape features. If omitted, it follows `EMBED_IMAGE_MODE`.
+
+```sh
+SHAPE_IMAGE_MODE=auto_roi
+```
+
+When changing `EMBED_IMAGE_MODE` or `SHAPE_IMAGE_MODE`, re-index the target drawings before judging similarity results. The mode is stored in Qdrant payload as `embedding_image_mode`, and the estimated shape ROI is stored as `shape_roi_json`.
 
 For local smoke tests without Python/OpenCLIP dependencies, set:
 

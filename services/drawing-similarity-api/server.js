@@ -32,6 +32,7 @@ const ocrTimeoutMs = Number.isFinite(configuredOcrTimeoutMs) && configuredOcrTim
   : 120000;
 const defaultShapeEngine = process.env.NODE_ENV === 'production' ? 'simple' : 'none';
 const shapeEngine = String(process.env.SHAPE_ENGINE || defaultShapeEngine).toLowerCase();
+const shapeImageMode = String(process.env.SHAPE_IMAGE_MODE || embeddingImageMode).toLowerCase();
 const shapeScript = process.env.SHAPE_SCRIPT || join(process.cwd(), 'extract_shape_profile.py');
 const configuredShapeTimeoutMs = Number(process.env.SHAPE_TIMEOUT_MS || 120000);
 const shapeTimeoutMs = Number.isFinite(configuredShapeTimeoutMs) && configuredShapeTimeoutMs > 0
@@ -114,6 +115,7 @@ const getRuntimeInfo = () => ({
   tesseractBin,
   ocrTimeoutMs,
   shapeEngine,
+  shapeImageMode,
   shapeScript,
   shapeTimeoutMs,
   timeout: {
@@ -450,7 +452,9 @@ const buildShapeProfile = async (pngBuffer, context = {}) => {
     const data = await runJsonCommand(pythonBin, [shapeScript, imagePath], {
       env: {
         ...process.env,
-        SHAPE_ENGINE: shapeEngine
+        SHAPE_ENGINE: shapeEngine,
+        SHAPE_IMAGE_MODE: shapeImageMode,
+        EMBED_IMAGE_MODE: embeddingImageMode
       },
       log: context.log,
       errorLog: context.errorLog,
@@ -463,6 +467,11 @@ const buildShapeProfile = async (pngBuffer, context = {}) => {
     return {
       engine: data.engine || 'simple',
       mode: data.mode || shapeEngine,
+      cropBox: data.cropBox || data.crop_box || null,
+      width: Number(data.width || 0),
+      height: Number(data.height || 0),
+      sourceWidth: Number(data.sourceWidth || 0),
+      sourceHeight: Number(data.sourceHeight || 0),
       bbox: data.bbox || null,
       bboxAspectRatio: Number(data.bboxAspectRatio || 0),
       bboxAreaRatio: Number(data.bboxAreaRatio || 0),
@@ -640,6 +649,11 @@ const normalizeShapeProfile = (value) => {
   return {
     engine: String(profile.engine || 'simple'),
     mode: String(profile.mode || 'simple'),
+    cropBox: profile.cropBox || profile.crop_box || null,
+    width: Number(profile.width || 0),
+    height: Number(profile.height || 0),
+    sourceWidth: Number(profile.sourceWidth || profile.source_width || 0),
+    sourceHeight: Number(profile.sourceHeight || profile.source_height || 0),
     bbox: typeof profile.bbox === 'string'
       ? (() => {
         try {
@@ -952,7 +966,7 @@ const assertEmbeddingVector = (embedding) => {
 };
 
 const buildEmbedding = async (buffer, context = {}) => {
-  if (embeddingImageMode !== 'full' && embeddingImageMode !== 'center_crop') {
+  if (embeddingImageMode !== 'full' && embeddingImageMode !== 'center_crop' && embeddingImageMode !== 'auto_roi') {
     const error = new Error('Unsupported EMBED_IMAGE_MODE: ' + embeddingImageMode);
     error.status = 500;
     throw error;
@@ -1168,6 +1182,12 @@ const upsertDrawing = async (body, embedding, context = {}) => {
               ocr_extraction_confidence: context.extracted?.extractionConfidence ?? null,
               shape_engine: context.shape?.engine || 'none',
               shape_mode: context.shape?.mode || 'none',
+              shape_image_mode: shapeImageMode,
+              shape_roi_json: context.shape?.cropBox ? safeJsonStringify(context.shape.cropBox) : '',
+              shape_width: context.shape?.width ?? null,
+              shape_height: context.shape?.height ?? null,
+              shape_source_width: context.shape?.sourceWidth ?? null,
+              shape_source_height: context.shape?.sourceHeight ?? null,
               shape_profile_json: context.shape ? safeJsonStringify(context.shape) : '',
               shape_bbox_json: context.shape?.bbox ? safeJsonStringify(context.shape.bbox) : '',
               shape_bbox_aspect_ratio: context.shape?.bboxAspectRatio ?? null,
@@ -1649,6 +1669,12 @@ const server = createServer(async (request, response) => {
         shape: {
           engine: shape.engine,
           mode: shape.mode,
+          imageMode: shapeImageMode,
+          cropBox: shape.cropBox || null,
+          width: shape.width || null,
+          height: shape.height || null,
+          sourceWidth: shape.sourceWidth || null,
+          sourceHeight: shape.sourceHeight || null,
           bboxAspectRatio: shape.bboxAspectRatio,
           bboxAreaRatio: shape.bboxAreaRatio,
           inkRatio: shape.inkRatio,
