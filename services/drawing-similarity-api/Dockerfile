@@ -7,6 +7,7 @@ RUN apt-get update \
 
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
+ENV TORCH_NUM_THREADS=1
 RUN python3 -m venv /opt/venv
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip \

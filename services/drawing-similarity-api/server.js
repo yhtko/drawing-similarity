@@ -11,9 +11,14 @@ const kintoneApiToken = process.env.KINTONE_API_TOKEN || '';
 const renderDpi = Number(process.env.PDF_RENDER_DPI || 160);
 const qdrantUrl = String(process.env.QDRANT_URL || '').replace(/\/+$/, '');
 const qdrantApiKey = process.env.QDRANT_API_KEY || '';
-const qdrantCollection = process.env.QDRANT_COLLECTION || 'drawing_similarity';
-const dummyVectorSize = Number(process.env.VECTOR_SIZE || 384);
-const embeddingProvider = process.env.EMBEDDING_PROVIDER || 'dummy';
+const defaultEmbeddingProvider = process.env.NODE_ENV === 'production' ? 'openclip' : 'dummy';
+const embeddingProvider = String(process.env.EMBEDDING_PROVIDER || defaultEmbeddingProvider).toLowerCase();
+const qdrantCollection = process.env.QDRANT_COLLECTION || (
+  embeddingProvider === 'openclip' ? 'drawing_similarity_openclip' : 'drawing_similarity'
+);
+const defaultVectorSize = embeddingProvider === 'openclip' ? 512 : 384;
+const expectedVectorSize = Number(process.env.VECTOR_SIZE || defaultVectorSize);
+const dummyVectorSize = expectedVectorSize;
 const pythonBin = process.env.PYTHON_BIN || 'python';
 const openClipScript = process.env.OPENCLIP_SCRIPT || join(process.cwd(), 'embed_openclip.py');
 let payloadIndexesReady = false;
@@ -39,6 +44,7 @@ const sendJson = (response, status, payload) => {
 
 const getRuntimeInfo = () => ({
   embeddingProvider,
+  expectedVectorSize,
   qdrantConfigured: isQdrantConfigured(),
   qdrantCollection,
   dummyVectorSize,
@@ -131,6 +137,7 @@ const buildOpenClipVector = async (buffer) => {
       provider: data.provider || 'openclip',
       model: data.model || '',
       pretrained: data.pretrained || '',
+      device: data.device || '',
       vector: data.vector
     };
   } finally {
@@ -138,17 +145,44 @@ const buildOpenClipVector = async (buffer) => {
   }
 };
 
+const assertEmbeddingVector = (embedding) => {
+  if (!Array.isArray(embedding.vector) || !embedding.vector.length) {
+    throw new Error('Embedding provider returned an empty vector');
+  }
+  if (!Number.isFinite(expectedVectorSize) || expectedVectorSize <= 0) {
+    throw new Error('VECTOR_SIZE must be a positive number');
+  }
+  if (embedding.vector.length !== expectedVectorSize) {
+    const error = new Error(
+      'Embedding vector size mismatch: provider=' + embedding.provider +
+      ' actual=' + embedding.vector.length +
+      ' expected=' + expectedVectorSize +
+      '. Set VECTOR_SIZE=' + embedding.vector.length +
+      ' and use a matching QDRANT_COLLECTION.'
+    );
+    error.status = 409;
+    throw error;
+  }
+  return embedding;
+};
+
 const buildEmbedding = async (buffer) => {
   if (embeddingProvider === 'openclip') {
-    return buildOpenClipVector(buffer);
+    return assertEmbeddingVector(await buildOpenClipVector(buffer));
   }
 
-  return {
+  if (embeddingProvider !== 'dummy' && embeddingProvider !== 'sha256-dummy') {
+    const error = new Error('Unsupported EMBEDDING_PROVIDER: ' + embeddingProvider);
+    error.status = 500;
+    throw error;
+  }
+
+  return assertEmbeddingVector({
     provider: 'sha256-dummy',
     model: '',
     pretrained: '',
     vector: buildVector(buffer)
-  };
+  });
 };
 
 const qdrantHeaders = () => {
@@ -289,11 +323,12 @@ const getPointVector = (point) => {
   return Object.values(point.vector).find((value) => Array.isArray(value)) || null;
 };
 
-const upsertDrawing = async (body, vector) => {
+const upsertDrawing = async (body, embedding) => {
   if (!isQdrantConfigured()) {
     return { configured: false, upserted: false };
   }
 
+  const vector = embedding.vector;
   await ensureCollection(vector.length);
   await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points?wait=true', {
     method: 'PUT',
@@ -308,7 +343,14 @@ const upsertDrawing = async (body, vector) => {
             app_id: body.appId ? String(body.appId) : '',
             drawing_no: body.drawingNo || '',
             product_name: body.productName || '',
-            file_name: body.fileName || ''
+            part_name: body.productName || '',
+            file_name: body.fileName || '',
+            file_key: body.fileKey || '',
+            indexed_at: new Date().toISOString(),
+            embedding_provider: embedding.provider,
+            embedding_model: embedding.model || '',
+            embedding_pretrained: embedding.pretrained || '',
+            embedding_vector_size: vector.length
           }
         }
       ]
@@ -572,7 +614,7 @@ const server = createServer(async (request, response) => {
       const body = await readJson(request);
       const { pdfBuffer, pngBuffer } = await loadRecordImage(body);
       const embedding = await buildEmbedding(pngBuffer);
-      const qdrant = await upsertDrawing(body, embedding.vector);
+      const qdrant = await upsertDrawing(body, embedding);
 
       sendJson(response, 202, {
         mode: qdrant.upserted ? 'qdrant-' + embedding.provider : 'pdf-ready',
@@ -597,6 +639,7 @@ const server = createServer(async (request, response) => {
           provider: embedding.provider,
           model: embedding.model,
           pretrained: embedding.pretrained,
+          device: embedding.device || '',
           size: embedding.vector.length
         },
         qdrant,

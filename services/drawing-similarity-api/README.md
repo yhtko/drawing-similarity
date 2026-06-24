@@ -27,28 +27,32 @@ Optional environment variables for Qdrant:
 ```sh
 QDRANT_URL=https://your-cluster-url
 QDRANT_API_KEY=your-api-key
-QDRANT_COLLECTION=drawing_similarity
-VECTOR_SIZE=384
+QDRANT_COLLECTION=drawing_similarity_openclip
+VECTOR_SIZE=512
 ```
 
-Optional environment variables for OpenCLIP:
+OpenCLIP is the default embedding provider when `NODE_ENV=production`.
+Use these values for the default model:
 
 ```sh
 EMBEDDING_PROVIDER=openclip
 OPENCLIP_MODEL=ViT-B-32
 OPENCLIP_PRETRAINED=laion2b_s34b_b79k
 OPENCLIP_DEVICE=cpu
+VECTOR_SIZE=512
 ```
 
-The default vector is a deterministic SHA-256 based dummy vector generated from the rendered PNG. This is only for validating Cloud Run to Qdrant wiring.
-
-When `EMBEDDING_PROVIDER=openclip` is set, the Node API calls `embed_openclip.py`, which uses OpenCLIP to generate normalized image embeddings. `ViT-B-32` embeddings are 512-dimensional, so use a fresh collection such as:
+For local smoke tests without Python/OpenCLIP dependencies, set:
 
 ```sh
-QDRANT_COLLECTION=drawing_similarity_openclip
+EMBEDDING_PROVIDER=dummy
+QDRANT_COLLECTION=drawing_similarity_dummy
+VECTOR_SIZE=384
 ```
 
-If an existing collection has a different vector size, the API returns a clear mismatch error instead of upserting incompatible vectors.
+The dummy vector is a deterministic SHA-256 based vector generated from the rendered PNG. It is only for validating Cloud Run to Qdrant wiring.
+
+When OpenCLIP is enabled, the Node API calls `embed_openclip.py`, which generates normalized image embeddings. `ViT-B-32` embeddings are 512-dimensional. If `VECTOR_SIZE` or the existing Qdrant collection size does not match the model output, the API returns a clear mismatch error instead of upserting incompatible vectors.
 
 Example request:
 
