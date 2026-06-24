@@ -41,6 +41,11 @@ const configuredOpenClipTimeoutMs = Number(process.env.OPENCLIP_TIMEOUT_MS || 18
 const openClipTimeoutMs = Number.isFinite(configuredOpenClipTimeoutMs) && configuredOpenClipTimeoutMs > 0
   ? configuredOpenClipTimeoutMs
   : 180000;
+const scoreVectorFloor = Number(process.env.SCORE_VECTOR_FLOOR || 0.75);
+const scoreVectorCeiling = Number(process.env.SCORE_VECTOR_CEILING || 0.98);
+const scoreVectorWeight = Number(process.env.SCORE_VECTOR_WEIGHT || 0.78);
+const scoreMetadataWeight = Number(process.env.SCORE_METADATA_WEIGHT || 0.12);
+const scoreShapeWeight = Number(process.env.SCORE_SHAPE_WEIGHT || 0.10);
 let payloadIndexesReady = false;
 
 const formatLogFields = (fields = {}) => Object.entries(fields)
@@ -115,6 +120,13 @@ const getRuntimeInfo = () => ({
     ocrMs: ocrTimeoutMs,
     shapeMs: shapeTimeoutMs,
     openclipMs: openClipTimeoutMs
+  },
+  scoring: {
+    vectorFloor: scoreVectorFloor,
+    vectorCeiling: scoreVectorCeiling,
+    vectorWeight: scoreVectorWeight,
+    metadataWeight: scoreMetadataWeight,
+    shapeWeight: scoreShapeWeight
   },
   nodeVersion: process.version,
   cwd: process.cwd(),
@@ -690,6 +702,20 @@ const profileSimilarity = (leftValues, rightValues) => {
   return Math.max(0, 1 - Math.min(diff / 2, 1));
 };
 
+const clamp01 = (value) => Math.max(0, Math.min(1, Number(value) || 0));
+
+const calibrateVectorScore = (score) => {
+  const raw = Number(score);
+  if (!Number.isFinite(raw)) {
+    return 0;
+  }
+  const floor = Number.isFinite(scoreVectorFloor) ? scoreVectorFloor : 0.75;
+  const ceiling = Number.isFinite(scoreVectorCeiling) && scoreVectorCeiling > floor
+    ? scoreVectorCeiling
+    : floor + 0.01;
+  return clamp01((raw - floor) / (ceiling - floor));
+};
+
 const scoreShapeCandidate = (candidatePayload = {}, queryShape = null) => {
   const candidateShape = normalizeShapeProfile(
     candidatePayload.shape_profile_json ||
@@ -812,7 +838,9 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
   };
 
   const scoreFromVector = Number(candidatePayload.__vectorScore || 0);
-  breakdown.vector = Number.isFinite(scoreFromVector) ? scoreFromVector : 0;
+  const calibratedVectorScore = calibrateVectorScore(scoreFromVector);
+  breakdown.vectorRaw = Number.isFinite(scoreFromVector) ? Number(scoreFromVector.toFixed(4)) : 0;
+  breakdown.vector = Number(calibratedVectorScore.toFixed(4));
 
   const candidateDrawingNo = normalizeSearchText(candidatePayload.drawing_no || candidatePayload.ocr_drawing_no);
   const candidateProductName = normalizeSearchText(candidatePayload.product_name || candidatePayload.ocr_product_name);
@@ -876,9 +904,19 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
     }
   }
 
-  const bonus = breakdown.drawingNo + breakdown.productName + breakdown.material + breakdown.thickness + breakdown.customer + breakdown.revision + breakdown.shapeCategory + breakdown.shape;
-  breakdown.bonus = Number(bonus.toFixed(3));
-  breakdown.total = Number(Math.min(1, breakdown.vector + breakdown.bonus).toFixed(4));
+  const metadataBonus = breakdown.drawingNo + breakdown.productName + breakdown.material + breakdown.thickness + breakdown.customer + breakdown.revision + breakdown.shapeCategory;
+  const metadataScore = clamp01(metadataBonus / 0.58);
+  const normalizedShapeScore = clamp01(breakdown.shape / 0.23);
+  const totalWeight = Math.max(0.01, scoreVectorWeight + scoreMetadataWeight + scoreShapeWeight);
+  const weightedTotal = (
+    calibratedVectorScore * scoreVectorWeight +
+    metadataScore * scoreMetadataWeight +
+    normalizedShapeScore * scoreShapeWeight
+  ) / totalWeight;
+
+  breakdown.metadata = Number(metadataScore.toFixed(4));
+  breakdown.bonus = Number((metadataBonus + breakdown.shape).toFixed(3));
+  breakdown.total = Number(clamp01(weightedTotal).toFixed(4));
 
   if (!reasons.length && candidatePayload.ocr_text) {
     reasons.push('OCR全文あり');
