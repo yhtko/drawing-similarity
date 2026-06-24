@@ -521,6 +521,122 @@ const extractOcrFields = (ocrText, body = {}) => {
   return extracted;
 };
 
+const normalizeSearchText = (value) => String(value || '')
+  .replace(/\u0000/g, '')
+  .trim()
+  .toLowerCase();
+
+const parseThicknessValue = (value) => {
+  const text = normalizeSearchText(value).replace(/,/g, '.');
+  const match = text.match(/([0-9]+(?:\.[0-9]+)?)/);
+  if (!match) {
+    return null;
+  }
+  const number = Number(match[1]);
+  return Number.isFinite(number) ? number : null;
+};
+
+const buildQueryProfile = (body = {}, indexedPayload = null) => ({
+  drawingNo: String(indexedPayload?.drawing_no || indexedPayload?.ocr_drawing_no || body.drawingNo || '').trim(),
+  productName: String(indexedPayload?.product_name || indexedPayload?.ocr_product_name || body.productName || '').trim(),
+  material: String(indexedPayload?.ocr_material || body.material || '').trim(),
+  thickness: String(indexedPayload?.ocr_thickness || body.thickness || '').trim(),
+  customer: String(indexedPayload?.ocr_customer || body.customer || '').trim(),
+  revision: String(indexedPayload?.ocr_revision || body.revision || '').trim(),
+  shapeCategory: String(indexedPayload?.ocr_shape_category || body.shapeCategory || '').trim(),
+  ocrText: String(indexedPayload?.ocr_text || body.ocrText || '').trim()
+});
+
+const scoreCandidate = (candidatePayload = {}, query = {}) => {
+  const reasons = [];
+  const breakdown = {
+    vector: 0,
+    drawingNo: 0,
+    productName: 0,
+    material: 0,
+    thickness: 0,
+    customer: 0,
+    revision: 0,
+    shapeCategory: 0,
+    bonus: 0,
+    total: 0
+  };
+
+  const scoreFromVector = Number(candidatePayload.__vectorScore || 0);
+  breakdown.vector = Number.isFinite(scoreFromVector) ? scoreFromVector : 0;
+
+  const candidateDrawingNo = normalizeSearchText(candidatePayload.drawing_no || candidatePayload.ocr_drawing_no);
+  const candidateProductName = normalizeSearchText(candidatePayload.product_name || candidatePayload.ocr_product_name);
+  const candidateMaterial = normalizeSearchText(candidatePayload.ocr_material);
+  const candidateThickness = normalizeSearchText(candidatePayload.ocr_thickness);
+  const candidateCustomer = normalizeSearchText(candidatePayload.ocr_customer);
+  const candidateRevision = normalizeSearchText(candidatePayload.ocr_revision);
+  const candidateShapeCategory = normalizeSearchText(candidatePayload.ocr_shape_category);
+
+  const queryDrawingNo = normalizeSearchText(query.drawingNo);
+  const queryProductName = normalizeSearchText(query.productName);
+  const queryMaterial = normalizeSearchText(query.material);
+  const queryThickness = normalizeSearchText(query.thickness);
+  const queryCustomer = normalizeSearchText(query.customer);
+  const queryRevision = normalizeSearchText(query.revision);
+  const queryShapeCategory = normalizeSearchText(query.shapeCategory);
+
+  if (queryDrawingNo && candidateDrawingNo && queryDrawingNo === candidateDrawingNo) {
+    breakdown.drawingNo = 0.15;
+    reasons.push('drawingNo一致');
+  }
+  if (queryProductName && candidateProductName && queryProductName === candidateProductName) {
+    breakdown.productName = 0.1;
+    reasons.push('品名一致');
+  }
+  if (queryMaterial && candidateMaterial && queryMaterial === candidateMaterial) {
+    breakdown.material = 0.08;
+    reasons.push('材質一致');
+  }
+  if (queryCustomer && candidateCustomer && queryCustomer === candidateCustomer) {
+    breakdown.customer = 0.06;
+    reasons.push('客先一致');
+  }
+  if (queryRevision && candidateRevision && queryRevision === candidateRevision) {
+    breakdown.revision = 0.03;
+    reasons.push('改訂一致');
+  }
+  if (queryShapeCategory && candidateShapeCategory && queryShapeCategory === candidateShapeCategory) {
+    breakdown.shapeCategory = 0.08;
+    reasons.push('形状分類一致');
+  }
+
+  const queryThicknessValue = parseThicknessValue(queryThickness);
+  const candidateThicknessValue = parseThicknessValue(candidateThickness);
+  if (queryThicknessValue !== null && candidateThicknessValue !== null) {
+    const diff = Math.abs(queryThicknessValue - candidateThicknessValue);
+    if (diff === 0) {
+      breakdown.thickness = 0.08;
+      reasons.push('板厚一致');
+    } else if (diff <= 0.2) {
+      breakdown.thickness = 0.05;
+      reasons.push('板厚近似');
+    } else if (diff <= 0.5) {
+      breakdown.thickness = 0.02;
+      reasons.push('板厚やや近似');
+    }
+  }
+
+  const bonus = breakdown.drawingNo + breakdown.productName + breakdown.material + breakdown.thickness + breakdown.customer + breakdown.revision + breakdown.shapeCategory;
+  breakdown.bonus = Number(bonus.toFixed(3));
+  breakdown.total = Number(Math.min(1, breakdown.vector + breakdown.bonus).toFixed(4));
+
+  if (!reasons.length && candidatePayload.ocr_text) {
+    reasons.push('OCR全文あり');
+  }
+
+  return {
+    score: breakdown.total,
+    scoreBreakdown: breakdown,
+    reasons
+  };
+};
+
 const assertEmbeddingVector = (embedding) => {
   if (!Array.isArray(embedding.vector) || !embedding.vector.length) {
     throw new Error('Embedding provider returned an empty vector');
@@ -827,7 +943,7 @@ const getIndexedDrawingVector = async (body) => {
   }
 };
 
-const searchDrawings = async (body, vector) => {
+const searchDrawings = async (body, vector, queryProfile = {}) => {
   if (!isQdrantConfigured()) {
     return null;
   }
@@ -855,14 +971,29 @@ const searchDrawings = async (body, vector) => {
 
   return (data.result || [])
     .filter((item) => String(item.payload?.record_id || '') !== String(body.recordId || ''))
-    .slice(0, Math.min(Number(body.limit || 10), 10))
-    .map((item) => ({
-      recordId: item.payload?.record_id || item.id,
-      drawingNo: item.payload?.drawing_no || 'record ' + item.id,
-      productName: item.payload?.product_name || '',
-      customer: item.payload?.file_name || '',
-      score: Number(item.score || 0)
-    }));
+    .map((item) => {
+      const payload = item.payload || {};
+      const scored = scoreCandidate({
+        ...payload,
+        __vectorScore: Number(item.score || 0)
+      }, queryProfile);
+      return {
+        recordId: payload.record_id || item.id,
+        drawingNo: payload.drawing_no || 'record ' + item.id,
+        productName: payload.product_name || '',
+        customer: payload.file_name || '',
+        material: payload.ocr_material || '',
+        thickness: payload.ocr_thickness || '',
+        revision: payload.ocr_revision || '',
+        shapeCategory: payload.ocr_shape_category || '',
+        ocrText: payload.ocr_text || '',
+        score: scored.score,
+        scoreBreakdown: scored.scoreBreakdown,
+        reasons: scored.reasons
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.min(Number(body.limit || 10), 10));
 };
 
 const assertKintoneConfig = () => {
@@ -983,6 +1114,7 @@ const server = createServer(async (request, response) => {
         let vector = indexed?.vector || null;
         let embedding = null;
         let queryVectorSource = 'indexed';
+        const queryProfile = buildQueryProfile(body, indexed?.payload || null);
 
         if (!vector && body.fileKey) {
           const { pngBuffer } = await loadRecordImage(body);
@@ -992,14 +1124,20 @@ const server = createServer(async (request, response) => {
         }
 
         if (vector) {
-          const results = await searchDrawings(body, vector);
+          const results = await searchDrawings(body, vector, queryProfile);
           sendJson(response, 200, {
             mode: indexed ? 'qdrant-indexed' : 'qdrant-' + embedding.provider,
             query: {
               tenantId: body.tenantId || 'default',
               appId: body.appId,
               recordId: body.recordId,
-              drawingNo: body.drawingNo || ''
+              drawingNo: queryProfile.drawingNo || body.drawingNo || '',
+              productName: queryProfile.productName || body.productName || '',
+              material: queryProfile.material || body.material || '',
+              thickness: queryProfile.thickness || body.thickness || '',
+              customer: queryProfile.customer || body.customer || '',
+              revision: queryProfile.revision || body.revision || '',
+              shapeCategory: queryProfile.shapeCategory || body.shapeCategory || ''
             },
             qdrant: {
               collection: qdrantCollection,
@@ -1007,6 +1145,16 @@ const server = createServer(async (request, response) => {
               queryVectorSource,
               queryPointId: indexed?.pointId || null
             },
+            extracted: indexed?.payload ? {
+              drawingNo: indexed.payload.ocr_drawing_no || indexed.payload.drawing_no || '',
+              productName: indexed.payload.ocr_product_name || indexed.payload.product_name || '',
+              material: indexed.payload.ocr_material || '',
+              thickness: indexed.payload.ocr_thickness || '',
+              customer: indexed.payload.ocr_customer || '',
+              revision: indexed.payload.ocr_revision || '',
+              shapeCategory: indexed.payload.ocr_shape_category || '',
+              ocrTextLength: String(indexed.payload.ocr_text || '').length
+            } : null,
             results
           });
           return;
