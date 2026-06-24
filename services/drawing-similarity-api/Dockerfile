@@ -17,6 +17,9 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY package.json ./
 COPY server.js ./
 COPY embed_openclip.py ./
+COPY extract_shape_profile.py ./
 
+ENV OPENCLIP_SCRIPT=/app/embed_openclip.py
+ENV SHAPE_SCRIPT=/app/extract_shape_profile.py
 ENV NODE_ENV=production
 CMD ["node", "server.js"]
