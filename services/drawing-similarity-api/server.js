@@ -24,7 +24,7 @@ const openClipScript = process.env.OPENCLIP_SCRIPT || join(process.cwd(), 'embed
 const embeddingImageMode = String(process.env.EMBED_IMAGE_MODE || 'full').toLowerCase();
 const defaultOcrEngine = process.env.NODE_ENV === 'production' ? 'tesseract' : 'none';
 const ocrEngine = String(process.env.OCR_ENGINE || defaultOcrEngine).toLowerCase();
-const ocrLangs = String(process.env.OCR_LANGS || 'eng').trim();
+const ocrLangs = String(process.env.OCR_LANGS || 'eng+jpn').trim();
 const tesseractBin = process.env.TESSERACT_BIN || 'tesseract';
 const configuredOcrTimeoutMs = Number(process.env.OCR_TIMEOUT_MS || 120000);
 const ocrTimeoutMs = Number.isFinite(configuredOcrTimeoutMs) && configuredOcrTimeoutMs > 0
@@ -397,6 +397,130 @@ const buildOcrText = async (pngBuffer, context = {}) => {
   }
 };
 
+const normalizeOcrText = (text) => String(text || '')
+  .replace(/\u0000/g, '')
+  .replace(/\r\n/g, '\n')
+  .replace(/\r/g, '\n')
+  .split('\n')
+  .map((line) => line.replace(/\s+/g, ' ').trim())
+  .filter(Boolean)
+  .join('\n')
+  .trim();
+
+const pickMatch = (text, patterns) => {
+  for (const pattern of patterns) {
+    const match = String(text || '').match(pattern);
+    if (match) {
+      return match[1] || match[0] || '';
+    }
+  }
+  return '';
+};
+
+const inferShapeCategory = (text, productName) => {
+  const source = `${text || ''} ${productName || ''}`.toLowerCase();
+  const rules = [
+    ['bracket', /ブラケット|bracket|stay|ステー/i],
+    ['plate', /板|plate|sheet|プレート/i],
+    ['shaft', /軸|shaft|ロッド|rod/i],
+    ['pipe', /管|pipe|tube|パイプ/i],
+    ['cover', /カバー|cover/i],
+    ['frame', /フレーム|frame/i],
+    ['housing', /ケース|housing|box/i]
+  ];
+  for (const [label, pattern] of rules) {
+    if (pattern.test(source)) {
+      return label;
+    }
+  }
+  return '';
+};
+
+const extractOcrFields = (ocrText, body = {}) => {
+  const text = normalizeOcrText(ocrText);
+  const compact = text.replace(/\s+/g, ' ');
+  const lines = text.split('\n').filter(Boolean);
+  const upper = compact.toUpperCase();
+  const joined = `\n${text}\n`;
+
+  const drawingNoCandidates = [
+    body.drawingNo,
+    pickMatch(text, [
+      /(?:図番|図面番号|DRAWING\s*NO\.?|DWG\.?\s*NO\.?|NO\.?)\s*[:：]?\s*([A-Z0-9\-\/_.]+[A-Z0-9])(?:\b|$)/i,
+      /(?:図番|図面番号)\s*[:：]?\s*([^\s\n]{3,})/i,
+      /\b([A-Z]{1,4}-?\d{2,}(?:[-\/][A-Z0-9]{1,})*)\b/
+    ])
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+
+  const productNameCandidates = [
+    body.productName,
+    pickMatch(text, [
+      /(?:品名|名称|TITLE|NAME)\s*[:：]?\s*([^\n]+)/i,
+      /(?:品名|名称)\s*[:：]?\s*([A-Za-z0-9ぁ-んァ-ヶ一-龥\-\(\)\/_. ]{2,})/i
+    ])
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+
+  const materialCandidates = [
+    pickMatch(text, [
+      /(?:材質|MATERIAL)\s*[:：]?\s*([^\n]+)/i,
+      /\b(SUS\d{3,4}|SS4?0?0|SPCC|SPHC|AL(?:UMINUM)?|A\d{4}|S45C|SCM\d{2}|SKD\d{2}|CRS|SGCC|SUJ\d{2})\b/i
+    ]),
+    pickMatch(text, [
+      /(?:材質)\s*[:：]?\s*([^\n]+)/i
+    ])
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+
+  const thicknessCandidates = [
+    pickMatch(text, [
+      /(?:板厚|THK)\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?\s*(?:mm)?)\b/i,
+      /\b([0-9]+(?:\.[0-9]+)?\s*(?:mm)?)\b(?=\s*(?:板厚|THK|t)\b)/i,
+      /\bt\s*([0-9]+(?:\.[0-9]+)?(?:mm)?)\b/i
+    ])
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+
+  const customerCandidates = [
+    body.customer,
+    pickMatch(text, [
+      /(?:客先|得意先|CUSTOMER|CLIENT)\s*[:：]?\s*([^\n]+)/i
+    ])
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+
+  const revisionCandidates = [
+    pickMatch(text, [
+      /(?:改訂|REV(?:ISION)?|REV\.)\s*[:：]?\s*([A-Z0-9\-]+)/i
+    ])
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+
+  const extracted = {
+    drawingNo: drawingNoCandidates[0] || '',
+    productName: productNameCandidates[0] || '',
+    material: materialCandidates[0] || '',
+    thickness: thicknessCandidates[0] || '',
+    customer: customerCandidates[0] || '',
+    revision: revisionCandidates[0] || '',
+    shapeCategory: inferShapeCategory(compact, productNameCandidates[0] || body.productName || ''),
+    ocrText: text,
+    ocrLines: lines,
+    extractionConfidence: 0.4
+  };
+
+  const score = [
+    extracted.drawingNo,
+    extracted.productName,
+    extracted.material,
+    extracted.thickness,
+    extracted.customer,
+    extracted.revision
+  ].filter(Boolean).length;
+
+  extracted.extractionConfidence = Number((0.25 + score * 0.12).toFixed(2));
+  if (joined.includes('図番') || joined.includes('品名') || joined.includes('材質') || joined.includes('板厚') || joined.includes('客先') || joined.includes('改訂')) {
+    extracted.extractionConfidence = Math.min(0.95, Number((extracted.extractionConfidence + 0.08).toFixed(2)));
+  }
+
+  return extracted;
+};
+
 const assertEmbeddingVector = (embedding) => {
   if (!Array.isArray(embedding.vector) || !embedding.vector.length) {
     throw new Error('Embedding provider returned an empty vector');
@@ -616,15 +740,23 @@ const upsertDrawing = async (body, embedding, context = {}) => {
               tenant_id: body.tenantId || 'default',
               record_id: String(body.recordId),
               app_id: body.appId ? String(body.appId) : '',
-              drawing_no: body.drawingNo || '',
-              product_name: body.productName || '',
-              part_name: body.productName || '',
+              drawing_no: context.extracted?.drawingNo || body.drawingNo || '',
+              product_name: context.extracted?.productName || body.productName || '',
+              part_name: context.extracted?.productName || body.productName || '',
               file_name: body.fileName || '',
               file_key: body.fileKey || '',
               indexed_at: new Date().toISOString(),
               ocr_engine: context.ocr?.engine || 'none',
               ocr_langs: context.ocr?.langs || '',
               ocr_text: context.ocr?.text || '',
+              ocr_drawing_no: context.extracted?.drawingNo || '',
+              ocr_product_name: context.extracted?.productName || '',
+              ocr_material: context.extracted?.material || '',
+              ocr_thickness: context.extracted?.thickness || '',
+              ocr_customer: context.extracted?.customer || '',
+              ocr_revision: context.extracted?.revision || '',
+              ocr_shape_category: context.extracted?.shapeCategory || '',
+              ocr_extraction_confidence: context.extracted?.extractionConfidence ?? null,
               embedding_provider: embedding.provider,
               embedding_model: embedding.model || '',
               embedding_pretrained: embedding.pretrained || '',
@@ -955,6 +1087,19 @@ const server = createServer(async (request, response) => {
         textLength: ocr.text.length
       });
 
+      step = 'extraction';
+      indexLog('extraction start');
+      const extracted = extractOcrFields(ocr.text, body);
+      indexLog('extraction done', {
+        drawingNo: extracted.drawingNo,
+        material: extracted.material,
+        thickness: extracted.thickness,
+        customer: extracted.customer,
+        revision: extracted.revision,
+        shapeCategory: extracted.shapeCategory,
+        confidence: extracted.extractionConfidence
+      });
+
       step = 'embedding';
       indexLog('embedding start', {
         provider: embeddingProvider,
@@ -976,7 +1121,8 @@ const server = createServer(async (request, response) => {
       const qdrant = await upsertDrawing(body, embedding, {
         log: indexLog,
         errorLog: indexError,
-        ocr
+        ocr,
+        extracted
       });
 
       sendJson(response, 202, {
@@ -993,6 +1139,16 @@ const server = createServer(async (request, response) => {
           engine: ocr.engine,
           langs: ocr.langs,
           textLength: ocr.text.length
+        },
+        extracted: {
+          drawingNo: extracted.drawingNo,
+          productName: extracted.productName,
+          material: extracted.material,
+          thickness: extracted.thickness,
+          customer: extracted.customer,
+          revision: extracted.revision,
+          shapeCategory: extracted.shapeCategory,
+          extractionConfidence: extracted.extractionConfidence
         },
         pdf: {
           bytes: pdfBuffer.length

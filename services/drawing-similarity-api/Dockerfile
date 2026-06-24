@@ -2,7 +2,7 @@ FROM node:20-slim
 
 WORKDIR /app
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 python3-venv poppler-utils tesseract-ocr \
+  && apt-get install -y --no-install-recommends python3 python3-venv poppler-utils tesseract-ocr tesseract-ocr-jpn \
   && rm -rf /var/lib/apt/lists/*
 
 ENV VIRTUAL_ENV=/opt/venv

@@ -47,10 +47,20 @@ OCR is enabled by default in production:
 
 ```sh
 OCR_ENGINE=tesseract
-OCR_LANGS=eng
+OCR_LANGS=eng+jpn
 OCR_TIMEOUT_MS=120000
 TESSERACT_BIN=tesseract
 ```
+
+The API also extracts a first-pass set of structured fields from OCR text:
+
+- `drawingNo`
+- `productName`
+- `material`
+- `thickness`
+- `customer`
+- `revision`
+- `shapeCategory`
 
 `EMBED_IMAGE_MODE` controls the image sent to the embedding provider:
 
