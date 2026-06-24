@@ -62,6 +62,25 @@ The API also extracts a first-pass set of structured fields from OCR text:
 - `revision`
 - `shapeCategory`
 
+Simple shape features are enabled by default in production:
+
+```sh
+SHAPE_ENGINE=simple
+SHAPE_TIMEOUT_MS=120000
+```
+
+The shape profile is computed from the rendered PNG and stored in Qdrant payload for scoring:
+
+- `shape_profile_json`
+- `shape_bbox_aspect_ratio`
+- `shape_bbox_area_ratio`
+- `shape_ink_ratio`
+- `shape_centroid_x`
+- `shape_centroid_y`
+- `shape_edge_density`
+- `shape_vertical_profile_json`
+- `shape_horizontal_profile_json`
+
 `EMBED_IMAGE_MODE` controls the image sent to the embedding provider:
 
 - `full`: use the full rendered first page.

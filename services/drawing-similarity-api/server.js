@@ -30,6 +30,13 @@ const configuredOcrTimeoutMs = Number(process.env.OCR_TIMEOUT_MS || 120000);
 const ocrTimeoutMs = Number.isFinite(configuredOcrTimeoutMs) && configuredOcrTimeoutMs > 0
   ? configuredOcrTimeoutMs
   : 120000;
+const defaultShapeEngine = process.env.NODE_ENV === 'production' ? 'simple' : 'none';
+const shapeEngine = String(process.env.SHAPE_ENGINE || defaultShapeEngine).toLowerCase();
+const shapeScript = process.env.SHAPE_SCRIPT || join(process.cwd(), 'extract_shape_profile.py');
+const configuredShapeTimeoutMs = Number(process.env.SHAPE_TIMEOUT_MS || 120000);
+const shapeTimeoutMs = Number.isFinite(configuredShapeTimeoutMs) && configuredShapeTimeoutMs > 0
+  ? configuredShapeTimeoutMs
+  : 120000;
 const configuredOpenClipTimeoutMs = Number(process.env.OPENCLIP_TIMEOUT_MS || 180000);
 const openClipTimeoutMs = Number.isFinite(configuredOpenClipTimeoutMs) && configuredOpenClipTimeoutMs > 0
   ? configuredOpenClipTimeoutMs
@@ -101,8 +108,12 @@ const getRuntimeInfo = () => ({
   ocrLangs,
   tesseractBin,
   ocrTimeoutMs,
+  shapeEngine,
+  shapeScript,
+  shapeTimeoutMs,
   timeout: {
     ocrMs: ocrTimeoutMs,
+    shapeMs: shapeTimeoutMs,
     openclipMs: openClipTimeoutMs
   },
   nodeVersion: process.version,
@@ -397,6 +408,64 @@ const buildOcrText = async (pngBuffer, context = {}) => {
   }
 };
 
+const buildShapeProfile = async (pngBuffer, context = {}) => {
+  if (shapeEngine === 'none') {
+    return {
+      engine: 'none',
+      mode: 'none',
+      bbox: null,
+      bboxAspectRatio: 0,
+      bboxAreaRatio: 0,
+      inkRatio: 0,
+      centroidX: 0.5,
+      centroidY: 0.5,
+      edgeDensity: 0,
+      verticalProfile: [],
+      horizontalProfile: []
+    };
+  }
+  if (shapeEngine !== 'simple') {
+    const error = new Error('Unsupported SHAPE_ENGINE: ' + shapeEngine);
+    error.status = 500;
+    throw error;
+  }
+
+  const workDir = await mkdtemp(join(tmpdir(), 'drawing-shape-'));
+  const imagePath = join(workDir, 'page.png');
+
+  try {
+    await writeFile(imagePath, pngBuffer);
+    const data = await runJsonCommand(pythonBin, [shapeScript, imagePath], {
+      env: {
+        ...process.env,
+        SHAPE_ENGINE: shapeEngine
+      },
+      log: context.log,
+      errorLog: context.errorLog,
+      logLabel: 'shape',
+      step: 'shape',
+      timeoutMs: shapeTimeoutMs,
+      timeoutMessage: 'Shape extraction timed out'
+    });
+
+    return {
+      engine: data.engine || 'simple',
+      mode: data.mode || shapeEngine,
+      bbox: data.bbox || null,
+      bboxAspectRatio: Number(data.bboxAspectRatio || 0),
+      bboxAreaRatio: Number(data.bboxAreaRatio || 0),
+      inkRatio: Number(data.inkRatio || 0),
+      centroidX: Number(data.centroidX || 0.5),
+      centroidY: Number(data.centroidY || 0.5),
+      edgeDensity: Number(data.edgeDensity || 0),
+      verticalProfile: Array.isArray(data.verticalProfile) ? data.verticalProfile : [],
+      horizontalProfile: Array.isArray(data.horizontalProfile) ? data.horizontalProfile : []
+    };
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+};
+
 const normalizeOcrText = (text) => String(text || '')
   .replace(/\u0000/g, '')
   .replace(/\r\n/g, '\n')
@@ -521,6 +590,185 @@ const extractOcrFields = (ocrText, body = {}) => {
   return extracted;
 };
 
+const normalizeArrayNumber = (value) => {
+  let values = value;
+  if (typeof values === 'string') {
+    try {
+      values = JSON.parse(values);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return values
+    .map((entry) => Number(entry))
+    .filter((entry) => Number.isFinite(entry));
+};
+
+const normalizeShapeProfile = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  let profile = value;
+  if (typeof value === 'string') {
+    try {
+      profile = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!profile || typeof profile !== 'object') {
+    return null;
+  }
+
+  return {
+    engine: String(profile.engine || 'simple'),
+    mode: String(profile.mode || 'simple'),
+    bbox: typeof profile.bbox === 'string'
+      ? (() => {
+        try {
+          const parsed = JSON.parse(profile.bbox);
+          return parsed && typeof parsed === 'object' ? parsed : null;
+        } catch {
+          return null;
+        }
+      })()
+      : profile.bbox && typeof profile.bbox === 'object'
+        ? profile.bbox
+        : null,
+    bboxAspectRatio: Number(profile.bboxAspectRatio || 0),
+    bboxAreaRatio: Number(profile.bboxAreaRatio || 0),
+    inkRatio: Number(profile.inkRatio || 0),
+    centroidX: Number(profile.centroidX || 0.5),
+    centroidY: Number(profile.centroidY || 0.5),
+    edgeDensity: Number(profile.edgeDensity || 0),
+    verticalProfile: normalizeArrayNumber(profile.verticalProfile),
+    horizontalProfile: normalizeArrayNumber(profile.horizontalProfile)
+  };
+};
+
+const safeJsonStringify = (value) => {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '';
+  }
+};
+
+const ratioSimilarity = (left, right) => {
+  const a = Number(left);
+  const b = Number(right);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) {
+    return null;
+  }
+  const diff = Math.abs(Math.log(a / b));
+  return Math.max(0, 1 - Math.min(diff / 1.5, 1));
+};
+
+const boundedDifferenceSimilarity = (left, right) => {
+  const a = Number(left);
+  const b = Number(right);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) {
+    return null;
+  }
+  return Math.max(0, 1 - Math.min(Math.abs(a - b), 1));
+};
+
+const profileSimilarity = (leftValues, rightValues) => {
+  if (!Array.isArray(leftValues) || !Array.isArray(rightValues) || !leftValues.length || !rightValues.length) {
+    return null;
+  }
+  const length = Math.min(leftValues.length, rightValues.length);
+  let diff = 0;
+  for (let index = 0; index < length; index += 1) {
+    diff += Math.abs(Number(leftValues[index] || 0) - Number(rightValues[index] || 0));
+  }
+  return Math.max(0, 1 - Math.min(diff / 2, 1));
+};
+
+const scoreShapeCandidate = (candidatePayload = {}, queryShape = null) => {
+  const candidateShape = normalizeShapeProfile(
+    candidatePayload.shape_profile_json ||
+    candidatePayload.shape_profile ||
+    (candidatePayload.shape_bbox_aspect_ratio !== undefined ? {
+      engine: candidatePayload.shape_engine || 'simple',
+      mode: candidatePayload.shape_mode || 'simple',
+      bbox: candidatePayload.shape_bbox_json || null,
+      bboxAspectRatio: candidatePayload.shape_bbox_aspect_ratio,
+      bboxAreaRatio: candidatePayload.shape_bbox_area_ratio,
+      inkRatio: candidatePayload.shape_ink_ratio,
+      centroidX: candidatePayload.shape_centroid_x,
+      centroidY: candidatePayload.shape_centroid_y,
+      edgeDensity: candidatePayload.shape_edge_density,
+      verticalProfile: candidatePayload.shape_vertical_profile_json || [],
+      horizontalProfile: candidatePayload.shape_horizontal_profile_json || []
+    } : null)
+  );
+
+  if (!candidateShape || !queryShape) {
+    return {
+      score: 0,
+      breakdown: {
+        aspect: 0,
+        area: 0,
+        ink: 0,
+        centroid: 0,
+        edge: 0,
+        projection: 0,
+        total: 0
+      },
+      reasons: []
+    };
+  }
+
+  const aspectSim = ratioSimilarity(queryShape.bboxAspectRatio, candidateShape.bboxAspectRatio);
+  const areaSim = boundedDifferenceSimilarity(queryShape.bboxAreaRatio, candidateShape.bboxAreaRatio);
+  const inkSim = boundedDifferenceSimilarity(queryShape.inkRatio, candidateShape.inkRatio);
+  const centroidXSim = boundedDifferenceSimilarity(queryShape.centroidX, candidateShape.centroidX);
+  const centroidYSim = boundedDifferenceSimilarity(queryShape.centroidY, candidateShape.centroidY);
+  const edgeSim = boundedDifferenceSimilarity(queryShape.edgeDensity, candidateShape.edgeDensity);
+  const verticalSim = profileSimilarity(queryShape.verticalProfile, candidateShape.verticalProfile);
+  const horizontalSim = profileSimilarity(queryShape.horizontalProfile, candidateShape.horizontalProfile);
+
+  const projectionSimValues = [verticalSim, horizontalSim].filter((value) => Number.isFinite(value));
+  const projectionSim = projectionSimValues.length
+    ? projectionSimValues.reduce((sum, value) => sum + value, 0) / projectionSimValues.length
+    : null;
+
+  const breakdown = {
+    aspect: Number(((aspectSim || 0) * 0.03).toFixed(4)),
+    area: Number(((areaSim || 0) * 0.03).toFixed(4)),
+    ink: Number(((inkSim || 0) * 0.03).toFixed(4)),
+    centroid: Number((((centroidXSim || 0) + (centroidYSim || 0)) / 2 * 0.03).toFixed(4)),
+    edge: Number(((edgeSim || 0) * 0.02).toFixed(4)),
+    projection: Number(((projectionSim || 0) * 0.09).toFixed(4)),
+    total: 0
+  };
+
+  breakdown.total = Number((breakdown.aspect + breakdown.area + breakdown.ink + breakdown.centroid + breakdown.edge + breakdown.projection).toFixed(4));
+
+  const reasons = [];
+  if ((projectionSim || 0) >= 0.7) {
+    reasons.push('輪郭近似');
+  }
+  if ((aspectSim || 0) >= 0.8 && (areaSim || 0) >= 0.7) {
+    reasons.push('外形近似');
+  }
+  if ((edgeSim || 0) >= 0.7) {
+    reasons.push('エッジ近似');
+  }
+
+  return {
+    score: breakdown.total,
+    breakdown,
+    reasons
+  };
+};
+
 const normalizeSearchText = (value) => String(value || '')
   .replace(/\u0000/g, '')
   .trim()
@@ -558,6 +806,7 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
     customer: 0,
     revision: 0,
     shapeCategory: 0,
+    shape: 0,
     bonus: 0,
     total: 0
   };
@@ -580,6 +829,7 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
   const queryCustomer = normalizeSearchText(query.customer);
   const queryRevision = normalizeSearchText(query.revision);
   const queryShapeCategory = normalizeSearchText(query.shapeCategory);
+  const shapeScore = scoreShapeCandidate(candidatePayload, query.shape || null);
 
   if (queryDrawingNo && candidateDrawingNo && queryDrawingNo === candidateDrawingNo) {
     breakdown.drawingNo = 0.15;
@@ -605,6 +855,10 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
     breakdown.shapeCategory = 0.08;
     reasons.push('形状分類一致');
   }
+  if (shapeScore.score > 0) {
+    breakdown.shape = Number(shapeScore.score.toFixed(4));
+    reasons.push(...shapeScore.reasons);
+  }
 
   const queryThicknessValue = parseThicknessValue(queryThickness);
   const candidateThicknessValue = parseThicknessValue(candidateThickness);
@@ -622,7 +876,7 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
     }
   }
 
-  const bonus = breakdown.drawingNo + breakdown.productName + breakdown.material + breakdown.thickness + breakdown.customer + breakdown.revision + breakdown.shapeCategory;
+  const bonus = breakdown.drawingNo + breakdown.productName + breakdown.material + breakdown.thickness + breakdown.customer + breakdown.revision + breakdown.shapeCategory + breakdown.shape;
   breakdown.bonus = Number(bonus.toFixed(3));
   breakdown.total = Number(Math.min(1, breakdown.vector + breakdown.bonus).toFixed(4));
 
@@ -633,7 +887,8 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
   return {
     score: breakdown.total,
     scoreBreakdown: breakdown,
-    reasons
+    reasons,
+    shapeScoreBreakdown: shapeScore.breakdown
   };
 };
 
@@ -873,6 +1128,18 @@ const upsertDrawing = async (body, embedding, context = {}) => {
               ocr_revision: context.extracted?.revision || '',
               ocr_shape_category: context.extracted?.shapeCategory || '',
               ocr_extraction_confidence: context.extracted?.extractionConfidence ?? null,
+              shape_engine: context.shape?.engine || 'none',
+              shape_mode: context.shape?.mode || 'none',
+              shape_profile_json: context.shape ? safeJsonStringify(context.shape) : '',
+              shape_bbox_json: context.shape?.bbox ? safeJsonStringify(context.shape.bbox) : '',
+              shape_bbox_aspect_ratio: context.shape?.bboxAspectRatio ?? null,
+              shape_bbox_area_ratio: context.shape?.bboxAreaRatio ?? null,
+              shape_ink_ratio: context.shape?.inkRatio ?? null,
+              shape_centroid_x: context.shape?.centroidX ?? null,
+              shape_centroid_y: context.shape?.centroidY ?? null,
+              shape_edge_density: context.shape?.edgeDensity ?? null,
+              shape_vertical_profile_json: context.shape?.verticalProfile ? safeJsonStringify(context.shape.verticalProfile) : '',
+              shape_horizontal_profile_json: context.shape?.horizontalProfile ? safeJsonStringify(context.shape.horizontalProfile) : '',
               embedding_provider: embedding.provider,
               embedding_model: embedding.model || '',
               embedding_pretrained: embedding.pretrained || '',
@@ -987,8 +1254,10 @@ const searchDrawings = async (body, vector, queryProfile = {}) => {
         revision: payload.ocr_revision || '',
         shapeCategory: payload.ocr_shape_category || '',
         ocrText: payload.ocr_text || '',
+        shape: normalizeShapeProfile(payload.shape_profile_json || payload.shape_profile || null),
         score: scored.score,
         scoreBreakdown: scored.scoreBreakdown,
+        shapeScoreBreakdown: scored.shapeScoreBreakdown,
         reasons: scored.reasons
       };
     })
@@ -1115,9 +1384,16 @@ const server = createServer(async (request, response) => {
         let embedding = null;
         let queryVectorSource = 'indexed';
         const queryProfile = buildQueryProfile(body, indexed?.payload || null);
+        queryProfile.shape = normalizeShapeProfile(
+          indexed?.payload?.shape_profile_json ||
+          indexed?.payload?.shape_profile ||
+          null
+        );
 
         if (!vector && body.fileKey) {
           const { pngBuffer } = await loadRecordImage(body);
+          const shape = await buildShapeProfile(pngBuffer);
+          queryProfile.shape = shape;
           embedding = await buildEmbedding(pngBuffer);
           vector = embedding.vector;
           queryVectorSource = 'rendered-pdf';
@@ -1137,7 +1413,8 @@ const server = createServer(async (request, response) => {
               thickness: queryProfile.thickness || body.thickness || '',
               customer: queryProfile.customer || body.customer || '',
               revision: queryProfile.revision || body.revision || '',
-              shapeCategory: queryProfile.shapeCategory || body.shapeCategory || ''
+              shapeCategory: queryProfile.shapeCategory || body.shapeCategory || '',
+              shape: queryProfile.shape || null
             },
             qdrant: {
               collection: qdrantCollection,
@@ -1153,7 +1430,8 @@ const server = createServer(async (request, response) => {
               customer: indexed.payload.ocr_customer || '',
               revision: indexed.payload.ocr_revision || '',
               shapeCategory: indexed.payload.ocr_shape_category || '',
-              ocrTextLength: String(indexed.payload.ocr_text || '').length
+              ocrTextLength: String(indexed.payload.ocr_text || '').length,
+              shape: normalizeShapeProfile(indexed?.payload?.shape_profile_json || indexed?.payload?.shape_profile || null)
             } : null,
             results
           });
@@ -1235,6 +1513,37 @@ const server = createServer(async (request, response) => {
         textLength: ocr.text.length
       });
 
+      step = 'shape';
+      indexLog('shape start', {
+        engine: shapeEngine
+      });
+      const shape = await buildShapeProfile(pngBuffer, {
+        log: indexLog,
+        errorLog: indexError
+      }).catch((error) => {
+        if (shapeEngine === 'none') {
+          return {
+            engine: 'none',
+            mode: 'none',
+            bbox: null,
+            bboxAspectRatio: 0,
+            bboxAreaRatio: 0,
+            inkRatio: 0,
+            centroidX: 0.5,
+            centroidY: 0.5,
+            edgeDensity: 0,
+            verticalProfile: [],
+            horizontalProfile: []
+          };
+        }
+        throw attachStep(error, step);
+      });
+      indexLog('shape done', {
+        engine: shape.engine,
+        bboxAspectRatio: shape.bboxAspectRatio,
+        edgeDensity: shape.edgeDensity
+      });
+
       step = 'extraction';
       indexLog('extraction start');
       const extracted = extractOcrFields(ocr.text, body);
@@ -1270,7 +1579,8 @@ const server = createServer(async (request, response) => {
         log: indexLog,
         errorLog: indexError,
         ocr,
-        extracted
+        extracted,
+        shape
       });
 
       sendJson(response, 202, {
@@ -1297,6 +1607,20 @@ const server = createServer(async (request, response) => {
           revision: extracted.revision,
           shapeCategory: extracted.shapeCategory,
           extractionConfidence: extracted.extractionConfidence
+        },
+        shape: {
+          engine: shape.engine,
+          mode: shape.mode,
+          bboxAspectRatio: shape.bboxAspectRatio,
+          bboxAreaRatio: shape.bboxAreaRatio,
+          inkRatio: shape.inkRatio,
+          centroidX: shape.centroidX,
+          centroidY: shape.centroidY,
+          edgeDensity: shape.edgeDensity
+        },
+        shapeProfiles: {
+          vertical: shape.verticalProfile,
+          horizontal: shape.horizontalProfile
         },
         pdf: {
           bytes: pdfBuffer.length
