@@ -21,7 +21,41 @@ const expectedVectorSize = Number(process.env.VECTOR_SIZE || defaultVectorSize);
 const dummyVectorSize = expectedVectorSize;
 const pythonBin = process.env.PYTHON_BIN || 'python';
 const openClipScript = process.env.OPENCLIP_SCRIPT || join(process.cwd(), 'embed_openclip.py');
+const configuredOpenClipTimeoutMs = Number(process.env.OPENCLIP_TIMEOUT_MS || 180000);
+const openClipTimeoutMs = Number.isFinite(configuredOpenClipTimeoutMs) && configuredOpenClipTimeoutMs > 0
+  ? configuredOpenClipTimeoutMs
+  : 180000;
 let payloadIndexesReady = false;
+
+const formatLogFields = (fields = {}) => Object.entries(fields)
+  .filter(([, value]) => value !== undefined && value !== null && value !== '')
+  .map(([key, value]) => key + '=' + String(value).replace(/\s+/g, ' ').slice(0, 1000))
+  .join(' ');
+
+const indexLog = (message, fields) => {
+  const suffix = formatLogFields(fields);
+  console.log('[index] ' + message + (suffix ? ' ' + suffix : ''));
+};
+
+const indexError = (message, fields) => {
+  const suffix = formatLogFields(fields);
+  console.error('[index] ' + message + (suffix ? ' ' + suffix : ''));
+};
+
+const attachStep = (error, step, status, extra = {}) => {
+  if (!error.step) {
+    error.step = step;
+  }
+  if (status && !error.status) {
+    error.status = status;
+  }
+  Object.assign(error, extra);
+  return error;
+};
+
+const createStepError = (message, step, status, extra = {}) => (
+  attachStep(new Error(message), step, status, extra)
+);
 
 const readJson = async (request) => {
   const chunks = [];
@@ -45,9 +79,19 @@ const sendJson = (response, status, payload) => {
 const getRuntimeInfo = () => ({
   embeddingProvider,
   expectedVectorSize,
+  vectorSize: expectedVectorSize,
   qdrantConfigured: isQdrantConfigured(),
   qdrantCollection,
   dummyVectorSize,
+  pythonCommand: pythonBin,
+  openclipScript: openClipScript,
+  openclipDevice: process.env.OPENCLIP_DEVICE || 'auto',
+  openclipTimeoutMs: openClipTimeoutMs,
+  timeout: {
+    openclipMs: openClipTimeoutMs
+  },
+  nodeVersion: process.version,
+  cwd: process.cwd(),
   openclip: {
     model: process.env.OPENCLIP_MODEL || 'ViT-B-32',
     pretrained: process.env.OPENCLIP_PRETRAINED || 'laion2b_s34b_b79k',
@@ -91,44 +135,109 @@ const buildVector = (buffer) => {
 };
 
 const runJsonCommand = (command, args, options = {}) => new Promise((resolve, reject) => {
+  const {
+    log = null,
+    errorLog = null,
+    logLabel = 'command',
+    step = 'command',
+    timeoutMs = 0,
+    timeoutMessage = command + ' timed out',
+    ...spawnOptions
+  } = options;
   const child = spawn(command, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    ...options
+    ...spawnOptions
   });
   const stdout = [];
   const stderr = [];
+  let settled = false;
+  let timedOut = false;
+  let timeoutId = null;
+
+  if (log) {
+    log(logLabel + ' spawn start', { command, timeoutMs });
+  }
+
+  const settle = (callback, value) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    callback(value);
+  };
+
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      if (errorLog) {
+        errorLog(logLabel + ' timeout', { timeoutMs });
+      }
+      child.kill('SIGKILL');
+    }, timeoutMs);
+  }
 
   child.stdout.on('data', (chunk) => {
     stdout.push(chunk);
+    if (log) {
+      log(logLabel + ' stdout received', { bytes: chunk.length });
+    }
   });
   child.stderr.on('data', (chunk) => {
     stderr.push(chunk);
+    if (errorLog) {
+      errorLog(logLabel + ' stderr received', {
+        bytes: chunk.length,
+        text: chunk.toString('utf8')
+      });
+    }
   });
 
-  child.on('error', reject);
+  child.on('error', (error) => {
+    if (errorLog) {
+      errorLog(logLabel + ' spawn error', { error: error.message });
+    }
+    settle(reject, attachStep(error, step));
+  });
   child.on('close', (code) => {
+    if (log) {
+      log(logLabel + ' exit code=' + code);
+    }
+    if (timedOut) {
+      settle(reject, createStepError(timeoutMessage, step, 504, { timeoutMs }));
+      return;
+    }
+
     const output = Buffer.concat(stdout).toString('utf8');
     if (code !== 0) {
-      reject(new Error(command + ' exited with ' + code + ': ' + Buffer.concat(stderr).toString('utf8')));
+      settle(reject, createStepError(command + ' exited with ' + code + ': ' + Buffer.concat(stderr).toString('utf8'), step));
       return;
     }
 
     try {
-      resolve(JSON.parse(output));
+      settle(resolve, JSON.parse(output));
     } catch (error) {
-      reject(new Error('Failed to parse ' + command + ' JSON output: ' + error.message + ' output=' + output.slice(0, 300)));
+      settle(reject, attachStep(new Error('Failed to parse ' + command + ' JSON output: ' + error.message + ' output=' + output.slice(0, 300)), step));
     }
   });
 });
 
-const buildOpenClipVector = async (buffer) => {
+const buildOpenClipVector = async (buffer, context = {}) => {
   const workDir = await mkdtemp(join(tmpdir(), 'drawing-embedding-'));
   const imagePath = join(workDir, 'page.png');
 
   try {
     await writeFile(imagePath, buffer);
     const data = await runJsonCommand(pythonBin, [openClipScript, imagePath], {
-      env: process.env
+      env: process.env,
+      log: context.log,
+      errorLog: context.errorLog,
+      logLabel: 'openclip',
+      step: 'embedding',
+      timeoutMs: openClipTimeoutMs,
+      timeoutMessage: 'OpenCLIP embedding timed out'
     });
     if (!Array.isArray(data.vector) || !data.vector.length) {
       throw new Error('OpenCLIP returned an empty vector');
@@ -166,9 +275,9 @@ const assertEmbeddingVector = (embedding) => {
   return embedding;
 };
 
-const buildEmbedding = async (buffer) => {
+const buildEmbedding = async (buffer, context = {}) => {
   if (embeddingProvider === 'openclip') {
-    return assertEmbeddingVector(await buildOpenClipVector(buffer));
+    return assertEmbeddingVector(await buildOpenClipVector(buffer, context));
   }
 
   if (embeddingProvider !== 'dummy' && embeddingProvider !== 'sha256-dummy') {
@@ -323,39 +432,60 @@ const getPointVector = (point) => {
   return Object.values(point.vector).find((value) => Array.isArray(value)) || null;
 };
 
-const upsertDrawing = async (body, embedding) => {
+const upsertDrawing = async (body, embedding, context = {}) => {
   if (!isQdrantConfigured()) {
+    if (context.log) {
+      context.log('qdrant upsert skipped', { configured: false });
+    }
     return { configured: false, upserted: false };
   }
 
   const vector = embedding.vector;
-  await ensureCollection(vector.length);
-  await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points?wait=true', {
-    method: 'PUT',
-    body: JSON.stringify({
-      points: [
-        {
-          id: toPointId(body.recordId),
-          vector,
-          payload: {
-            tenant_id: body.tenantId || 'default',
-            record_id: String(body.recordId),
-            app_id: body.appId ? String(body.appId) : '',
-            drawing_no: body.drawingNo || '',
-            product_name: body.productName || '',
-            part_name: body.productName || '',
-            file_name: body.fileName || '',
-            file_key: body.fileKey || '',
-            indexed_at: new Date().toISOString(),
-            embedding_provider: embedding.provider,
-            embedding_model: embedding.model || '',
-            embedding_pretrained: embedding.pretrained || '',
-            embedding_vector_size: vector.length
+  if (context.log) {
+    context.log('qdrant ensure collection start', { collection: qdrantCollection, vectorSize: vector.length });
+  }
+  try {
+    await ensureCollection(vector.length);
+  } catch (error) {
+    throw attachStep(error, 'qdrant_ensure_collection');
+  }
+  if (context.log) {
+    context.log('qdrant ensure collection done', { collection: qdrantCollection });
+    context.log('qdrant upsert start', { collection: qdrantCollection, recordId: body.recordId });
+  }
+  try {
+    await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points?wait=true', {
+      method: 'PUT',
+      body: JSON.stringify({
+        points: [
+          {
+            id: toPointId(body.recordId),
+            vector,
+            payload: {
+              tenant_id: body.tenantId || 'default',
+              record_id: String(body.recordId),
+              app_id: body.appId ? String(body.appId) : '',
+              drawing_no: body.drawingNo || '',
+              product_name: body.productName || '',
+              part_name: body.productName || '',
+              file_name: body.fileName || '',
+              file_key: body.fileKey || '',
+              indexed_at: new Date().toISOString(),
+              embedding_provider: embedding.provider,
+              embedding_model: embedding.model || '',
+              embedding_pretrained: embedding.pretrained || '',
+              embedding_vector_size: vector.length
+            }
           }
-        }
-      ]
-    })
-  });
+        ]
+      })
+    });
+  } catch (error) {
+    throw attachStep(error, 'qdrant_upsert');
+  }
+  if (context.log) {
+    context.log('qdrant upsert done', { collection: qdrantCollection, recordId: body.recordId });
+  }
 
   return {
     configured: true,
@@ -515,7 +645,10 @@ const convertPdfFirstPageToPng = async (pdfBuffer) => {
   try {
     await writeFile(pdfPath, pdfBuffer);
     await runCommand('pdftoppm', ['-f', '1', '-singlefile', '-png', '-r', String(renderDpi), pdfPath, outputBase]);
-    return await readFile(imagePath);
+    return {
+      pngBuffer: await readFile(imagePath),
+      imagePath
+    };
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
@@ -534,7 +667,7 @@ const loadRecordImage = async (body) => {
   }
 
   const pdfBuffer = await fetchKintoneFile(body.fileKey);
-  const pngBuffer = await convertPdfFirstPageToPng(pdfBuffer);
+  const { pngBuffer } = await convertPdfFirstPageToPng(pdfBuffer);
   return { pdfBuffer, pngBuffer };
 };
 
@@ -610,13 +743,61 @@ const server = createServer(async (request, response) => {
   }
 
   if (request.method === 'POST' && url.pathname === '/index') {
+    let step = 'start';
+    indexLog('start');
     try {
+      step = 'payload';
       const body = await readJson(request);
-      const { pdfBuffer, pngBuffer } = await loadRecordImage(body);
-      const embedding = await buildEmbedding(pngBuffer);
-      const qdrant = await upsertDrawing(body, embedding);
+      indexLog('payload received', {
+        recordId: body.recordId,
+        tenantId: body.tenantId || 'default'
+      });
+
+      if (!body.recordId) {
+        throw createStepError('recordId is required', step, 400);
+      }
+      if (!body.fileKey) {
+        throw createStepError('fileKey is required', step, 400);
+      }
+
+      step = 'fetch_kintone_file';
+      indexLog('fetch kintone file start', { recordId: body.recordId });
+      const pdfBuffer = await fetchKintoneFile(body.fileKey).catch((error) => {
+        throw attachStep(error, step);
+      });
+      indexLog('fetch kintone file done', { bytes: pdfBuffer.length });
+
+      step = 'pdf_render';
+      indexLog('pdf render start', { bytes: pdfBuffer.length, dpi: renderDpi });
+      const { pngBuffer, imagePath } = await convertPdfFirstPageToPng(pdfBuffer).catch((error) => {
+        throw attachStep(error, step);
+      });
+      indexLog('pdf render done', {
+        imagePath,
+        bytes: pngBuffer.length
+      });
+
+      step = 'embedding';
+      indexLog('embedding start', { provider: embeddingProvider });
+      const embedding = await buildEmbedding(pngBuffer, {
+        log: indexLog,
+        errorLog: indexError
+      }).catch((error) => {
+        throw attachStep(error, step);
+      });
+      indexLog('embedding done', {
+        dimension: embedding.vector.length,
+        provider: embedding.provider
+      });
+
+      step = 'qdrant_upsert';
+      const qdrant = await upsertDrawing(body, embedding, {
+        log: indexLog,
+        errorLog: indexError
+      });
 
       sendJson(response, 202, {
+        ok: true,
         mode: qdrant.upserted ? 'qdrant-' + embedding.provider : 'pdf-ready',
         accepted: true,
         tenantId: body.tenantId || 'default',
@@ -651,8 +832,25 @@ const server = createServer(async (request, response) => {
           )
           : 'Set QDRANT_URL to enable vector upsert.'
       });
+      indexLog('response sent', { status: 202 });
     } catch (error) {
-      sendJson(response, error.status || 500, { error: error.message });
+      const failedStep = error.step || step;
+      const status = error.status || 500;
+      indexError('failed', {
+        step: failedStep,
+        status,
+        error: error.message
+      });
+      const payload = {
+        ok: false,
+        error: error.message,
+        step: failedStep
+      };
+      if (error.timeoutMs) {
+        payload.timeoutMs = error.timeoutMs;
+      }
+      sendJson(response, status, payload);
+      indexLog('response sent', { status, step: failedStep });
     }
     return;
   }
