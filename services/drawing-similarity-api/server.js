@@ -21,6 +21,7 @@ const expectedVectorSize = Number(process.env.VECTOR_SIZE || defaultVectorSize);
 const dummyVectorSize = expectedVectorSize;
 const pythonBin = process.env.PYTHON_BIN || 'python';
 const openClipScript = process.env.OPENCLIP_SCRIPT || join(process.cwd(), 'embed_openclip.py');
+const embeddingImageMode = String(process.env.EMBED_IMAGE_MODE || 'full').toLowerCase();
 const configuredOpenClipTimeoutMs = Number(process.env.OPENCLIP_TIMEOUT_MS || 180000);
 const openClipTimeoutMs = Number.isFinite(configuredOpenClipTimeoutMs) && configuredOpenClipTimeoutMs > 0
   ? configuredOpenClipTimeoutMs
@@ -78,6 +79,7 @@ const sendJson = (response, status, payload) => {
 
 const getRuntimeInfo = () => ({
   embeddingProvider,
+  embeddingImageMode,
   expectedVectorSize,
   vectorSize: expectedVectorSize,
   qdrantConfigured: isQdrantConfigured(),
@@ -231,7 +233,10 @@ const buildOpenClipVector = async (buffer, context = {}) => {
   try {
     await writeFile(imagePath, buffer);
     const data = await runJsonCommand(pythonBin, [openClipScript, imagePath], {
-      env: process.env,
+      env: {
+        ...process.env,
+        EMBED_IMAGE_MODE: embeddingImageMode
+      },
       log: context.log,
       errorLog: context.errorLog,
       logLabel: 'openclip',
@@ -247,6 +252,8 @@ const buildOpenClipVector = async (buffer, context = {}) => {
       model: data.model || '',
       pretrained: data.pretrained || '',
       device: data.device || '',
+      imageMode: data.image_mode || embeddingImageMode,
+      image: data.image || null,
       vector: data.vector
     };
   } finally {
@@ -276,6 +283,12 @@ const assertEmbeddingVector = (embedding) => {
 };
 
 const buildEmbedding = async (buffer, context = {}) => {
+  if (embeddingImageMode !== 'full' && embeddingImageMode !== 'center_crop') {
+    const error = new Error('Unsupported EMBED_IMAGE_MODE: ' + embeddingImageMode);
+    error.status = 500;
+    throw error;
+  }
+
   if (embeddingProvider === 'openclip') {
     return assertEmbeddingVector(await buildOpenClipVector(buffer, context));
   }
@@ -290,6 +303,8 @@ const buildEmbedding = async (buffer, context = {}) => {
     provider: 'sha256-dummy',
     model: '',
     pretrained: '',
+    imageMode: embeddingImageMode,
+    image: null,
     vector: buildVector(buffer)
   });
 };
@@ -474,6 +489,7 @@ const upsertDrawing = async (body, embedding, context = {}) => {
               embedding_provider: embedding.provider,
               embedding_model: embedding.model || '',
               embedding_pretrained: embedding.pretrained || '',
+              embedding_image_mode: embedding.imageMode || embeddingImageMode,
               embedding_vector_size: vector.length
             }
           }
@@ -778,7 +794,10 @@ const server = createServer(async (request, response) => {
       });
 
       step = 'embedding';
-      indexLog('embedding start', { provider: embeddingProvider });
+      indexLog('embedding start', {
+        provider: embeddingProvider,
+        imageMode: embeddingImageMode
+      });
       const embedding = await buildEmbedding(pngBuffer, {
         log: indexLog,
         errorLog: indexError
@@ -787,7 +806,8 @@ const server = createServer(async (request, response) => {
       });
       indexLog('embedding done', {
         dimension: embedding.vector.length,
-        provider: embedding.provider
+        provider: embedding.provider,
+        imageMode: embedding.imageMode || embeddingImageMode
       });
 
       step = 'qdrant_upsert';
@@ -821,6 +841,8 @@ const server = createServer(async (request, response) => {
           model: embedding.model,
           pretrained: embedding.pretrained,
           device: embedding.device || '',
+          imageMode: embedding.imageMode || embeddingImageMode,
+          image: embedding.image || null,
           size: embedding.vector.length
         },
         qdrant,

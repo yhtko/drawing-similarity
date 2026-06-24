@@ -7,6 +7,9 @@ import torch
 from PIL import Image
 
 
+CENTER_CROP_BOX = (0.05, 0.10, 0.85, 0.80)
+
+
 def choose_device() -> str:
     requested = os.environ.get("OPENCLIP_DEVICE", "auto").lower()
     if requested == "cpu":
@@ -18,6 +21,39 @@ def choose_device() -> str:
     if requested != "auto":
         raise RuntimeError("OPENCLIP_DEVICE must be auto, cpu, or cuda")
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def prepare_image(image_path: str):
+    image_mode = os.environ.get("EMBED_IMAGE_MODE", "full").lower()
+    image = Image.open(image_path).convert("RGB")
+    source_width, source_height = image.size
+    crop_box = None
+
+    if image_mode == "center_crop":
+        left_ratio, top_ratio, right_ratio, bottom_ratio = CENTER_CROP_BOX
+        crop_box = {
+            "left": int(source_width * left_ratio),
+            "top": int(source_height * top_ratio),
+            "right": int(source_width * right_ratio),
+            "bottom": int(source_height * bottom_ratio),
+        }
+        image = image.crop((
+            crop_box["left"],
+            crop_box["top"],
+            crop_box["right"],
+            crop_box["bottom"],
+        ))
+    elif image_mode != "full":
+        raise RuntimeError("EMBED_IMAGE_MODE must be full or center_crop")
+
+    return image, {
+        "mode": image_mode,
+        "source_width": source_width,
+        "source_height": source_height,
+        "width": image.size[0],
+        "height": image.size[1],
+        "crop_box": crop_box,
+    }
 
 
 def main() -> int:
@@ -36,7 +72,8 @@ def main() -> int:
     model.to(device)
     model.eval()
 
-    image = preprocess(Image.open(image_path).convert("RGB")).unsqueeze(0).to(device)
+    image, image_info = prepare_image(image_path)
+    image = preprocess(image).unsqueeze(0).to(device)
 
     with torch.inference_mode():
         features = model.encode_image(image)
@@ -49,6 +86,8 @@ def main() -> int:
         "pretrained": pretrained,
         "device": device,
         "dimension": len(vector),
+        "image_mode": image_info["mode"],
+        "image": image_info,
         "vector": vector,
     }))
     return 0

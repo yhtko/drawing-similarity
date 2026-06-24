@@ -39,8 +39,16 @@ EMBEDDING_PROVIDER=openclip
 OPENCLIP_MODEL=ViT-B-32
 OPENCLIP_PRETRAINED=laion2b_s34b_b79k
 OPENCLIP_DEVICE=cpu
+EMBED_IMAGE_MODE=center_crop
 VECTOR_SIZE=512
 ```
+
+`EMBED_IMAGE_MODE` controls the image sent to the embedding provider:
+
+- `full`: use the full rendered first page.
+- `center_crop`: crop the rendered image to x 5%-85% and y 10%-80% before OpenCLIP embedding.
+
+When changing `EMBED_IMAGE_MODE`, re-index the target drawings before judging similarity results. The mode is stored in Qdrant payload as `embedding_image_mode`.
 
 For local smoke tests without Python/OpenCLIP dependencies, set:
 
