@@ -6,7 +6,7 @@ Current endpoints:
 
 - `GET /health`
 - `POST /index`: downloads the kintone PDF, renders page 1 to PNG, creates a deterministic dummy vector, and upserts to Qdrant when configured.
-- `POST /similar`: searches Qdrant with the current PDF dummy vector when configured, otherwise returns mock results.
+- `POST /similar`: searches Qdrant with the already indexed record vector when available. If the record is not indexed yet and `fileKey` is supplied, it falls back to downloading the PDF, rendering page 1, and generating a query vector. Otherwise it returns mock results.
 
 Run locally:
 

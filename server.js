@@ -279,6 +279,16 @@ const toPointId = (recordId) => {
   return createHash('sha256').update(String(recordId)).digest('hex').slice(0, 32);
 };
 
+const getPointVector = (point) => {
+  if (Array.isArray(point?.vector)) {
+    return point.vector;
+  }
+  if (!point?.vector || typeof point.vector !== 'object') {
+    return null;
+  }
+  return Object.values(point.vector).find((value) => Array.isArray(value)) || null;
+};
+
 const upsertDrawing = async (body, vector) => {
   if (!isQdrantConfigured()) {
     return { configured: false, upserted: false };
@@ -311,6 +321,51 @@ const upsertDrawing = async (body, vector) => {
     collection: qdrantCollection,
     vectorSize: vector.length
   };
+};
+
+const getIndexedDrawingVector = async (body) => {
+  if (!isQdrantConfigured() || !body.recordId) {
+    return null;
+  }
+
+  try {
+    const data = await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points', {
+      method: 'POST',
+      body: JSON.stringify({
+        ids: [toPointId(body.recordId)],
+        with_payload: true,
+        with_vector: true
+      })
+    });
+    const point = Array.isArray(data.result) ? data.result[0] : null;
+    if (!point) {
+      return null;
+    }
+
+    const payload = point.payload || {};
+    if (String(payload.tenant_id || 'default') !== String(body.tenantId || 'default')) {
+      return null;
+    }
+    if (body.appId && payload.app_id && String(payload.app_id) !== String(body.appId)) {
+      return null;
+    }
+
+    const vector = getPointVector(point);
+    if (!Array.isArray(vector) || !vector.length) {
+      return null;
+    }
+
+    return {
+      pointId: point.id,
+      payload,
+      vector
+    };
+  } catch (error) {
+    if (error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
 };
 
 const searchDrawings = async (body, vector) => {
@@ -461,25 +516,39 @@ const server = createServer(async (request, response) => {
   if (request.method === 'POST' && url.pathname === '/similar') {
     try {
       const body = await readJson(request);
-      if (isQdrantConfigured() && body.fileKey) {
-        const { pngBuffer } = await loadRecordImage(body);
-        const embedding = await buildEmbedding(pngBuffer);
-        const results = await searchDrawings(body, embedding.vector);
-        sendJson(response, 200, {
-          mode: 'qdrant-' + embedding.provider,
-          query: {
-            tenantId: body.tenantId || 'default',
-            appId: body.appId,
-            recordId: body.recordId,
-            drawingNo: body.drawingNo || ''
-          },
-          qdrant: {
-            collection: qdrantCollection,
-            vectorSize: embedding.vector.length
-          },
-          results
-        });
-        return;
+      if (isQdrantConfigured()) {
+        const indexed = await getIndexedDrawingVector(body);
+        let vector = indexed?.vector || null;
+        let embedding = null;
+        let queryVectorSource = 'indexed';
+
+        if (!vector && body.fileKey) {
+          const { pngBuffer } = await loadRecordImage(body);
+          embedding = await buildEmbedding(pngBuffer);
+          vector = embedding.vector;
+          queryVectorSource = 'rendered-pdf';
+        }
+
+        if (vector) {
+          const results = await searchDrawings(body, vector);
+          sendJson(response, 200, {
+            mode: indexed ? 'qdrant-indexed' : 'qdrant-' + embedding.provider,
+            query: {
+              tenantId: body.tenantId || 'default',
+              appId: body.appId,
+              recordId: body.recordId,
+              drawingNo: body.drawingNo || ''
+            },
+            qdrant: {
+              collection: qdrantCollection,
+              vectorSize: vector.length,
+              queryVectorSource,
+              queryPointId: indexed?.pointId || null
+            },
+            results
+          });
+          return;
+        }
       }
 
       sendJson(response, 200, {
