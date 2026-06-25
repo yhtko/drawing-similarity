@@ -117,6 +117,16 @@ VECTOR_SIZE=384
 
 The dummy vector is a deterministic SHA-256 based vector generated from the rendered PNG. It is only for validating Cloud Run to Qdrant wiring.
 
+
+For faster registration, the Cloud Run image starts a local OpenCLIP embedding server and keeps the model loaded between requests:
+
+```sh
+EMBEDDING_ENDPOINT=http://127.0.0.1:9090
+EMBEDDING_PORT=9090
+```
+
+If `EMBEDDING_ENDPOINT` is unset, the API falls back to spawning `embed_openclip.py` per request. The endpoint mode avoids reloading OpenCLIP for every `/index` call, so the first request pays the model-load cost and later requests should be faster.
+
 When OpenCLIP is enabled, the Node API calls `embed_openclip.py`, which generates normalized image embeddings. `ViT-B-32` embeddings are 512-dimensional. If `VECTOR_SIZE` or the existing Qdrant collection size does not match the model output, the API returns a clear mismatch error instead of upserting incompatible vectors.
 
 Example request:

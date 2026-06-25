@@ -21,6 +21,7 @@ const expectedVectorSize = Number(process.env.VECTOR_SIZE || defaultVectorSize);
 const dummyVectorSize = expectedVectorSize;
 const pythonBin = process.env.PYTHON_BIN || 'python';
 const openClipScript = process.env.OPENCLIP_SCRIPT || join(process.cwd(), 'embed_openclip.py');
+const embeddingEndpoint = String(process.env.EMBEDDING_ENDPOINT || '').replace(/\/+$/, '');
 const embeddingImageMode = String(process.env.EMBED_IMAGE_MODE || 'full').toLowerCase();
 const defaultOcrEngine = process.env.NODE_ENV === 'production' ? 'tesseract' : 'none';
 const ocrEngine = String(process.env.OCR_ENGINE || defaultOcrEngine).toLowerCase();
@@ -79,6 +80,8 @@ const createStepError = (message, step, status, extra = {}) => (
   attachStep(new Error(message), step, status, extra)
 );
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const readJson = async (request) => {
   const chunks = [];
   for await (const chunk of request) {
@@ -108,6 +111,7 @@ const getRuntimeInfo = () => ({
   dummyVectorSize,
   pythonCommand: pythonBin,
   openclipScript: openClipScript,
+  embeddingEndpoint: embeddingEndpoint || null,
   openclipDevice: process.env.OPENCLIP_DEVICE || 'auto',
   openclipTimeoutMs: openClipTimeoutMs,
   ocrEngine,
@@ -147,7 +151,7 @@ const buildMockResults = (body) => {
     return {
       recordId,
       drawingNo: 'DWG-' + String(recordId).padStart(5, '0'),
-      productName: index === 0 ? body.productName || 'サンプル部品' : '類似候補 ' + (index + 1),
+      productName: index === 0 ? body.productName || 'sample part' : 'similar candidate ' + (index + 1),
       customer: 'PoC',
       score: Number((0.92 - index * 0.035).toFixed(3))
     };
@@ -347,7 +351,78 @@ const runTextCommand = (command, args, options = {}) => new Promise((resolve, re
   });
 });
 
+const normalizeEmbeddingResult = (data) => {
+  if (!Array.isArray(data.vector) || !data.vector.length) {
+    throw new Error('OpenCLIP returned an empty vector');
+  }
+  return {
+    provider: data.provider || 'openclip',
+    model: data.model || '',
+    pretrained: data.pretrained || '',
+    device: data.device || '',
+    imageMode: data.image_mode || embeddingImageMode,
+    image: data.image || null,
+    vector: data.vector
+  };
+};
+
+const buildOpenClipVectorViaEndpoint = async (buffer, context = {}) => {
+  const startedAt = Date.now();
+  let lastError = null;
+
+  if (context.log) {
+    context.log('openclip endpoint request start', { endpoint: embeddingEndpoint, timeoutMs: openClipTimeoutMs });
+  }
+
+  while (Date.now() - startedAt < openClipTimeoutMs) {
+    const controller = new AbortController();
+    const remainingMs = Math.max(1000, openClipTimeoutMs - (Date.now() - startedAt));
+    const timeoutId = setTimeout(() => controller.abort(), remainingMs);
+    try {
+      const response = await fetch(embeddingEndpoint + '/embed', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          image_base64: buffer.toString('base64'),
+          image_mode: embeddingImageMode
+        }),
+        signal: controller.signal
+      });
+      const text = await response.text();
+      if (context.log) {
+        context.log('openclip endpoint response received', { status: response.status, bytes: text.length });
+      }
+      if (!response.ok) {
+        throw createStepError('OpenCLIP endpoint failed with ' + response.status + ': ' + text.slice(0, 500), 'embedding', response.status === 504 ? 504 : 500);
+      }
+      return normalizeEmbeddingResult(JSON.parse(text));
+    } catch (error) {
+      lastError = error;
+      if (error.name === 'AbortError') {
+        throw createStepError('OpenCLIP embedding timed out', 'embedding', 504, { timeoutMs: openClipTimeoutMs });
+      }
+      if (context.errorLog) {
+        context.errorLog('openclip endpoint retry', { error: error.message });
+      }
+      await sleep(1000);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  if (lastError) {
+    throw attachStep(lastError, 'embedding');
+  }
+  throw createStepError('OpenCLIP embedding timed out', 'embedding', 504, { timeoutMs: openClipTimeoutMs });
+};
+
 const buildOpenClipVector = async (buffer, context = {}) => {
+  if (embeddingEndpoint) {
+    return buildOpenClipVectorViaEndpoint(buffer, context);
+  }
+
   const workDir = await mkdtemp(join(tmpdir(), 'drawing-embedding-'));
   const imagePath = join(workDir, 'page.png');
 
@@ -365,18 +440,7 @@ const buildOpenClipVector = async (buffer, context = {}) => {
       timeoutMs: openClipTimeoutMs,
       timeoutMessage: 'OpenCLIP embedding timed out'
     });
-    if (!Array.isArray(data.vector) || !data.vector.length) {
-      throw new Error('OpenCLIP returned an empty vector');
-    }
-    return {
-      provider: data.provider || 'openclip',
-      model: data.model || '',
-      pretrained: data.pretrained || '',
-      device: data.device || '',
-      imageMode: data.image_mode || embeddingImageMode,
-      image: data.image || null,
-      vector: data.vector
-    };
+    return normalizeEmbeddingResult(data);
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
@@ -508,15 +572,15 @@ const pickMatch = (text, patterns) => {
 };
 
 const inferShapeCategory = (text, productName) => {
-  const source = `${text || ''} ${productName || ''}`.toLowerCase();
+  const source = ((text || '') + ' ' + (productName || '')).toLowerCase();
   const rules = [
-    ['bracket', /ブラケット|bracket|stay|ステー/i],
-    ['plate', /板|plate|sheet|プレート/i],
-    ['shaft', /軸|shaft|ロッド|rod/i],
-    ['pipe', /管|pipe|tube|パイプ/i],
-    ['cover', /カバー|cover/i],
-    ['frame', /フレーム|frame/i],
-    ['housing', /ケース|housing|box/i]
+    ['bracket', /bracket|stay|lever/i],
+    ['plate', /plate|sheet|panel/i],
+    ['shaft', /shaft|rod|pin/i],
+    ['pipe', /pipe|tube/i],
+    ['cover', /cover|cap/i],
+    ['frame', /frame/i],
+    ['housing', /housing|case|box/i]
   ];
   for (const [label, pattern] of rules) {
     if (pattern.test(source)) {
@@ -528,86 +592,45 @@ const inferShapeCategory = (text, productName) => {
 
 const extractOcrFields = (ocrText, body = {}) => {
   const text = normalizeOcrText(ocrText);
-  const compact = text.replace(/\s+/g, ' ');
   const lines = text.split('\n').filter(Boolean);
-  const upper = compact.toUpperCase();
-  const joined = `\n${text}\n`;
 
-  const drawingNoCandidates = [
-    body.drawingNo,
-    pickMatch(text, [
-      /(?:図番|図面番号|DRAWING\s*NO\.?|DWG\.?\s*NO\.?|NO\.?)\s*[:：]?\s*([A-Z0-9\-\/_.]+[A-Z0-9])(?:\b|$)/i,
-      /(?:図番|図面番号)\s*[:：]?\s*([^\s\n]{3,})/i,
-      /\b([A-Z]{1,4}-?\d{2,}(?:[-\/][A-Z0-9]{1,})*)\b/
-    ])
-  ].map((value) => String(value || '').trim()).filter(Boolean);
-
-  const productNameCandidates = [
-    body.productName,
-    pickMatch(text, [
-      /(?:品名|名称|TITLE|NAME)\s*[:：]?\s*([^\n]+)/i,
-      /(?:品名|名称)\s*[:：]?\s*([A-Za-z0-9ぁ-んァ-ヶ一-龥\-\(\)\/_. ]{2,})/i
-    ])
-  ].map((value) => String(value || '').trim()).filter(Boolean);
-
-  const materialCandidates = [
-    pickMatch(text, [
-      /(?:材質|MATERIAL)\s*[:：]?\s*([^\n]+)/i,
-      /\b(SUS\d{3,4}|SS4?0?0|SPCC|SPHC|AL(?:UMINUM)?|A\d{4}|S45C|SCM\d{2}|SKD\d{2}|CRS|SGCC|SUJ\d{2})\b/i
-    ]),
-    pickMatch(text, [
-      /(?:材質)\s*[:：]?\s*([^\n]+)/i
-    ])
-  ].map((value) => String(value || '').trim()).filter(Boolean);
-
-  const thicknessCandidates = [
-    pickMatch(text, [
-      /(?:板厚|THK)\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?\s*(?:mm)?)\b/i,
-      /\b([0-9]+(?:\.[0-9]+)?\s*(?:mm)?)\b(?=\s*(?:板厚|THK|t)\b)/i,
-      /\bt\s*([0-9]+(?:\.[0-9]+)?(?:mm)?)\b/i
-    ])
-  ].map((value) => String(value || '').trim()).filter(Boolean);
-
-  const customerCandidates = [
-    body.customer,
-    pickMatch(text, [
-      /(?:客先|得意先|CUSTOMER|CLIENT)\s*[:：]?\s*([^\n]+)/i
-    ])
-  ].map((value) => String(value || '').trim()).filter(Boolean);
-
-  const revisionCandidates = [
-    pickMatch(text, [
-      /(?:改訂|REV(?:ISION)?|REV\.)\s*[:：]?\s*([A-Z0-9\-]+)/i
-    ])
-  ].map((value) => String(value || '').trim()).filter(Boolean);
+  const drawingNo = String(body.drawingNo || pickMatch(text, [
+    /(?:DRAWING\s*NO\.?|DWG\.?\s*NO\.?|PART\s*NO\.?|NO\.?)\s*[:#-]?\s*([A-Z0-9][A-Z0-9\-\/_\.]{2,})/i,
+    /\b([A-Z][0-9A-Z]{2,}[-_][0-9A-Z][0-9A-Z\-\/_\.]{2,})\b/i
+  ]) || '').trim();
+  const productName = String(body.productName || pickMatch(text, [
+    /(?:TITLE|NAME|DESCRIPTION)\s*[:#-]?\s*([^\n]{2,80})/i
+  ]) || '').trim();
+  const material = String(body.material || pickMatch(text, [
+    /(?:MATERIAL|MATL\.?|MAT\.?)\s*[:#-]?\s*([^\n]{2,80})/i,
+    /\b(SUS\d{3,4}|SS4?0?0|SPCC|SPHC|AL(?:UMINUM)?|A\d{4}|S45C|SCM\d{2}|SKD\d{2}|CRS|SGCC|SUJ\d{2})\b/i
+  ]) || '').trim();
+  const thickness = String(body.thickness || pickMatch(text, [
+    /(?:THK|T)\s*[:#-]?\s*([0-9]+(?:\.[0-9]+)?\s*(?:mm)?)/i,
+    /\bt\s*([0-9]+(?:\.[0-9]+)?\s*(?:mm)?)\b/i
+  ]) || '').trim();
+  const customer = String(body.customer || pickMatch(text, [
+    /(?:CUSTOMER|CLIENT)\s*[:#-]?\s*([^\n]{2,80})/i
+  ]) || '').trim();
+  const revision = String(body.revision || pickMatch(text, [
+    /(?:REV(?:ISION)?|REV\.)\s*[:#-]?\s*([A-Z0-9\-]+)/i
+  ]) || '').trim();
 
   const extracted = {
-    drawingNo: drawingNoCandidates[0] || '',
-    productName: productNameCandidates[0] || '',
-    material: materialCandidates[0] || '',
-    thickness: thicknessCandidates[0] || '',
-    customer: customerCandidates[0] || '',
-    revision: revisionCandidates[0] || '',
-    shapeCategory: inferShapeCategory(compact, productNameCandidates[0] || body.productName || ''),
+    drawingNo,
+    productName,
+    material,
+    thickness,
+    customer,
+    revision,
+    shapeCategory: inferShapeCategory(text, productName || body.productName || ''),
     ocrText: text,
     ocrLines: lines,
-    extractionConfidence: 0.4
+    extractionConfidence: 0.25
   };
 
-  const score = [
-    extracted.drawingNo,
-    extracted.productName,
-    extracted.material,
-    extracted.thickness,
-    extracted.customer,
-    extracted.revision
-  ].filter(Boolean).length;
-
+  const score = [drawingNo, productName, material, thickness, customer, revision].filter(Boolean).length;
   extracted.extractionConfidence = Number((0.25 + score * 0.12).toFixed(2));
-  if (joined.includes('図番') || joined.includes('品名') || joined.includes('材質') || joined.includes('板厚') || joined.includes('客先') || joined.includes('改訂')) {
-    extracted.extractionConfidence = Math.min(0.95, Number((extracted.extractionConfidence + 0.08).toFixed(2)));
-  }
-
   return extracted;
 };
 
@@ -793,13 +816,13 @@ const scoreShapeCandidate = (candidatePayload = {}, queryShape = null) => {
 
   const reasons = [];
   if ((projectionSim || 0) >= 0.7) {
-    reasons.push('輪郭近似');
+    reasons.push('profile similar');
   }
   if ((aspectSim || 0) >= 0.8 && (areaSim || 0) >= 0.7) {
-    reasons.push('外形近似');
+    reasons.push('outline similar');
   }
   if ((edgeSim || 0) >= 0.7) {
-    reasons.push('エッジ近似');
+    reasons.push('edge similar');
   }
 
   return {
@@ -875,27 +898,27 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
 
   if (queryDrawingNo && candidateDrawingNo && queryDrawingNo === candidateDrawingNo) {
     breakdown.drawingNo = 0.15;
-    reasons.push('drawingNo一致');
+    reasons.push('drawingNo match');
   }
   if (queryProductName && candidateProductName && queryProductName === candidateProductName) {
     breakdown.productName = 0.1;
-    reasons.push('品名一致');
+    reasons.push('productName match');
   }
   if (queryMaterial && candidateMaterial && queryMaterial === candidateMaterial) {
     breakdown.material = 0.08;
-    reasons.push('材質一致');
+    reasons.push('material match');
   }
   if (queryCustomer && candidateCustomer && queryCustomer === candidateCustomer) {
     breakdown.customer = 0.06;
-    reasons.push('客先一致');
+    reasons.push('customer match');
   }
   if (queryRevision && candidateRevision && queryRevision === candidateRevision) {
     breakdown.revision = 0.03;
-    reasons.push('改訂一致');
+    reasons.push('revision match');
   }
   if (queryShapeCategory && candidateShapeCategory && queryShapeCategory === candidateShapeCategory) {
     breakdown.shapeCategory = 0.08;
-    reasons.push('形状分類一致');
+    reasons.push('shape category match');
   }
   if (shapeScore.score > 0) {
     breakdown.shape = Number(shapeScore.score.toFixed(4));
@@ -908,13 +931,13 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
     const diff = Math.abs(queryThicknessValue - candidateThicknessValue);
     if (diff === 0) {
       breakdown.thickness = 0.08;
-      reasons.push('板厚一致');
+      reasons.push('thickness match');
     } else if (diff <= 0.2) {
       breakdown.thickness = 0.05;
-      reasons.push('板厚近似');
+      reasons.push('thickness close');
     } else if (diff <= 0.5) {
       breakdown.thickness = 0.02;
-      reasons.push('板厚やや近似');
+      reasons.push('thickness roughly close');
     }
   }
 
@@ -933,7 +956,7 @@ const scoreCandidate = (candidatePayload = {}, query = {}) => {
   breakdown.total = Number(clamp01(weightedTotal).toFixed(4));
 
   if (!reasons.length && candidatePayload.ocr_text) {
-    reasons.push('OCR全文あり');
+    reasons.push('ocr text available');
   }
 
   return {
