@@ -83,6 +83,20 @@ const createStepError = (message, step, status, extra = {}) => (
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const formatEndpointError = (error) => {
+  const parts = [error.message];
+  if (error.cause?.code) {
+    parts.push('code=' + error.cause.code);
+  }
+  if (error.cause?.address) {
+    parts.push('address=' + error.cause.address);
+  }
+  if (error.cause?.port) {
+    parts.push('port=' + error.cause.port);
+  }
+  return parts.filter(Boolean).join(' ');
+};
+
 const readJson = async (request) => {
   const chunks = [];
   for await (const chunk of request) {
@@ -409,7 +423,7 @@ const buildOpenClipVectorViaEndpoint = async (buffer, context = {}) => {
         throw createStepError('OpenCLIP embedding timed out', 'embedding', 504, { timeoutMs: openClipTimeoutMs });
       }
       if (context.errorLog) {
-        context.errorLog('openclip endpoint retry', { error: error.message });
+        context.errorLog('openclip endpoint retry', { endpoint: embeddingEndpoint, error: formatEndpointError(error) });
       }
       await sleep(1000);
     } finally {
@@ -418,7 +432,7 @@ const buildOpenClipVectorViaEndpoint = async (buffer, context = {}) => {
   }
 
   if (lastError) {
-    throw attachStep(lastError, 'embedding');
+    throw attachStep(new Error('Embedding endpoint failed: ' + formatEndpointError(lastError)), 'embedding');
   }
   throw createStepError('OpenCLIP embedding timed out', 'embedding', 504, { timeoutMs: openClipTimeoutMs });
 };

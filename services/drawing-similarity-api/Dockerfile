@@ -25,4 +25,4 @@ ENV EMBEDDING_ENDPOINT=http://127.0.0.1:9090
 ENV SHAPE_SCRIPT=/app/extract_shape_profile.py
 
 ENV NODE_ENV=production
-CMD ["sh", "-c", "python /app/embedding_server.py & node server.js"]
+CMD ["sh", "-c", "python -u /app/embedding_server.py & echo embedding_server_pid=$!; node server.js"]
