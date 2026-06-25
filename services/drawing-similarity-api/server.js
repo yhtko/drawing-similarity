@@ -1363,7 +1363,9 @@ const searchDrawings = async (body, vector, queryProfile = {}) => {
   const limit = Math.min((Number(body.limit || 10) + 1) * Math.max(1, queryVectors.length) * 4, 100);
   const byRecord = new Map();
 
-  for (const queryVector of queryVectors) {
+  for (let queryIndex = 0; queryIndex < queryVectors.length; queryIndex += 1) {
+    const queryVector = queryVectors[queryIndex];
+    const queryRotation = embeddingRotations[queryIndex] ?? queryIndex;
     const data = await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points/search', {
       method: 'POST',
       body: JSON.stringify({
@@ -1389,15 +1391,35 @@ const searchDrawings = async (body, vector, queryProfile = {}) => {
         continue;
       }
       const key = String(payload.record_id || item.id);
+      const score = Number(item.score || 0);
+      const rotationScore = {
+        queryRotation,
+        candidateRotation: Number(payload.embedding_rotation ?? 0),
+        vectorRaw: Number(score.toFixed(4)),
+        pointId: item.id
+      };
       const existing = byRecord.get(key);
-      if (!existing || Number(item.score || 0) > Number(existing.score || 0)) {
-        byRecord.set(key, item);
+      if (existing) {
+        existing.rotationScores.push(rotationScore);
+        if (score > Number(existing.item.score || 0)) {
+          existing.item = item;
+          existing.queryRotation = queryRotation;
+          existing.candidateRotation = rotationScore.candidateRotation;
+        }
+      } else {
+        byRecord.set(key, {
+          item,
+          queryRotation,
+          candidateRotation: rotationScore.candidateRotation,
+          rotationScores: [rotationScore]
+        });
       }
     }
   }
 
   return Array.from(byRecord.values())
-    .map((item) => {
+    .map((entry) => {
+      const item = entry.item;
       const payload = item.payload || {};
       const scored = scoreCandidate({
         ...payload,
@@ -1414,7 +1436,11 @@ const searchDrawings = async (body, vector, queryProfile = {}) => {
         shapeCategory: payload.ocr_shape_category || '',
         ocrText: payload.ocr_text || '',
         shape: normalizeShapeProfile(payload.shape_profile_json || payload.shape_profile || null),
-        embeddingRotation: payload.embedding_rotation ?? null,
+        embeddingRotation: entry.candidateRotation ?? payload.embedding_rotation ?? null,
+        queryEmbeddingRotation: entry.queryRotation ?? null,
+        rotationScores: entry.rotationScores
+          .sort((a, b) => b.vectorRaw - a.vectorRaw)
+          .slice(0, 20),
         score: scored.score,
         scoreBreakdown: scored.scoreBreakdown,
         shapeScoreBreakdown: scored.shapeScoreBreakdown,
