@@ -47,13 +47,7 @@ class EmbeddingState:
     def load_openclip(self):
         self.model_name = OPENCLIP_MODEL
         self.pretrained = OPENCLIP_PRETRAINED
-        print(json.dumps({
-            "event": "embedding_model_load_start",
-            "provider": "openclip",
-            "model": self.model_name,
-            "pretrained": self.pretrained,
-            "device": self.device,
-        }), flush=True)
+        print(json.dumps({"event": "embedding_model_load_start", "provider": "openclip", "model": self.model_name, "pretrained": self.pretrained, "device": self.device}), flush=True)
         self.model, _, self.preprocess = open_clip.create_model_and_transforms(self.model_name, pretrained=self.pretrained)
         self.model.to(self.device)
         self.model.eval()
@@ -64,12 +58,7 @@ class EmbeddingState:
 
         self.model_name = DINO_MODEL
         self.pretrained = ""
-        print(json.dumps({
-            "event": "embedding_model_load_start",
-            "provider": "dinov2",
-            "model": self.model_name,
-            "device": self.device,
-        }), flush=True)
+        print(json.dumps({"event": "embedding_model_load_start", "provider": "dinov2", "model": self.model_name, "device": self.device}), flush=True)
         self.processor = AutoImageProcessor.from_pretrained(self.model_name)
         self.model = AutoModel.from_pretrained(self.model_name)
         self.model.to(self.device)
@@ -103,8 +92,13 @@ class EmbeddingState:
             features = functional.normalize(features, p=2, dim=-1)
         return features.squeeze(0).detach().cpu().tolist()
 
-    def embed(self, image_bytes, image_mode):
+    def embed(self, image_bytes, image_mode, rotation=0):
         image, image_info = self.prepare_input_image(image_bytes, image_mode)
+        rotation = int(rotation or 0) % 360
+        if rotation:
+            image = image.rotate(-rotation, expand=True)
+        image_info["rotation"] = rotation
+
         if self.provider == "openclip":
             vector = self.embed_openclip(image)
         else:
@@ -118,6 +112,7 @@ class EmbeddingState:
             "dimension": len(vector),
             "image_mode": image_info["mode"],
             "image": image_info,
+            "rotation": rotation,
             "vector": vector,
         }
 
@@ -160,7 +155,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             image_bytes = base64.b64decode(payload.get("image_base64", ""), validate=True)
             image_mode = str(payload.get("image_mode") or os.environ.get("EMBED_IMAGE_MODE", "full")).lower()
-            result = get_state().embed(image_bytes, image_mode)
+            rotation = int(payload.get("rotation") or 0)
+            result = get_state().embed(image_bytes, image_mode, rotation)
             json_response(self, 200, result)
         except Exception as exc:
             print(json.dumps({"event": "embedding_error", "provider": PROVIDER, "error": str(exc)}), flush=True)

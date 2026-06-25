@@ -24,6 +24,15 @@ const pythonBin = process.env.PYTHON_BIN || 'python';
 const openClipScript = process.env.OPENCLIP_SCRIPT || join(process.cwd(), 'embed_openclip.py');
 const embeddingEndpoint = String(process.env.EMBEDDING_ENDPOINT || '').replace(/\/+$/, '');
 const embeddingImageMode = String(process.env.EMBED_IMAGE_MODE || 'full').toLowerCase();
+const embeddingRotations = String(process.env.EMBED_ROTATIONS || '0')
+  .split(',')
+  .map((value) => Number(value.trim()))
+  .filter((value) => Number.isFinite(value) && value % 90 === 0)
+  .map((value) => ((value % 360) + 360) % 360)
+  .filter((value, index, values) => values.indexOf(value) === index);
+if (!embeddingRotations.length) {
+  embeddingRotations.push(0);
+}
 const defaultOcrEngine = process.env.NODE_ENV === 'production' ? 'tesseract' : 'none';
 const ocrEngine = String(process.env.OCR_ENGINE || defaultOcrEngine).toLowerCase();
 const ocrLangs = String(process.env.OCR_LANGS || 'eng+jpn').trim();
@@ -119,6 +128,7 @@ const sendJson = (response, status, payload) => {
 const getRuntimeInfo = () => ({
   embeddingProvider,
   embeddingImageMode,
+  embeddingRotations,
   expectedVectorSize,
   vectorSize: expectedVectorSize,
   qdrantConfigured: isQdrantConfigured(),
@@ -1167,6 +1177,13 @@ const toPointId = (recordId) => {
   return createHash('sha256').update(String(recordId)).digest('hex').slice(0, 32);
 };
 
+const toPointIdWithRotation = (recordId, rotation) => {
+  const normalizedRotation = ((Number(rotation) || 0) % 360 + 360) % 360;
+  if (normalizedRotation === 0) {
+    return toPointId(recordId);
+  }
+  return createHash('sha256').update(String(recordId) + ':rot:' + normalizedRotation).digest('hex').slice(0, 32);
+};
 const getPointVector = (point) => {
   if (Array.isArray(point?.vector)) {
     return point.vector;
@@ -1185,88 +1202,96 @@ const upsertDrawing = async (body, embedding, context = {}) => {
     return { configured: false, upserted: false };
   }
 
-  const vector = embedding.vector;
+  const embeddings = Array.isArray(embedding) ? embedding : [embedding];
+  const firstVector = embeddings[0]?.vector || [];
   if (context.log) {
-    context.log('qdrant ensure collection start', { collection: qdrantCollection, vectorSize: vector.length });
+    context.log('qdrant ensure collection start', { collection: qdrantCollection, vectorSize: firstVector.length });
   }
   try {
-    await ensureCollection(vector.length);
+    await ensureCollection(firstVector.length);
   } catch (error) {
     throw attachStep(error, 'qdrant_ensure_collection');
   }
   if (context.log) {
     context.log('qdrant ensure collection done', { collection: qdrantCollection });
-    context.log('qdrant upsert start', { collection: qdrantCollection, recordId: body.recordId });
+    context.log('qdrant upsert start', { collection: qdrantCollection, recordId: body.recordId, points: embeddings.length });
   }
+
+  const basePayload = {
+    tenant_id: body.tenantId || 'default',
+    record_id: String(body.recordId),
+    app_id: body.appId ? String(body.appId) : '',
+    drawing_no: context.extracted?.drawingNo || body.drawingNo || '',
+    product_name: context.extracted?.productName || body.productName || '',
+    part_name: context.extracted?.productName || body.productName || '',
+    file_name: body.fileName || '',
+    file_key: body.fileKey || '',
+    indexed_at: new Date().toISOString(),
+    ocr_engine: context.ocr?.engine || 'none',
+    ocr_langs: context.ocr?.langs || '',
+    ocr_text: context.ocr?.text || '',
+    ocr_drawing_no: context.extracted?.drawingNo || '',
+    ocr_product_name: context.extracted?.productName || '',
+    ocr_material: context.extracted?.material || '',
+    ocr_thickness: context.extracted?.thickness || '',
+    ocr_customer: context.extracted?.customer || '',
+    ocr_revision: context.extracted?.revision || '',
+    ocr_shape_category: context.extracted?.shapeCategory || '',
+    ocr_extraction_confidence: context.extracted?.extractionConfidence ?? null,
+    shape_engine: context.shape?.engine || 'none',
+    shape_mode: context.shape?.mode || 'none',
+    shape_image_mode: shapeImageMode,
+    shape_roi_json: context.shape?.cropBox ? safeJsonStringify(context.shape.cropBox) : '',
+    shape_width: context.shape?.width ?? null,
+    shape_height: context.shape?.height ?? null,
+    shape_source_width: context.shape?.sourceWidth ?? null,
+    shape_source_height: context.shape?.sourceHeight ?? null,
+    shape_profile_json: context.shape ? safeJsonStringify(context.shape) : '',
+    shape_bbox_json: context.shape?.bbox ? safeJsonStringify(context.shape.bbox) : '',
+    shape_bbox_aspect_ratio: context.shape?.bboxAspectRatio ?? null,
+    shape_bbox_area_ratio: context.shape?.bboxAreaRatio ?? null,
+    shape_ink_ratio: context.shape?.inkRatio ?? null,
+    shape_centroid_x: context.shape?.centroidX ?? null,
+    shape_centroid_y: context.shape?.centroidY ?? null,
+    shape_edge_density: context.shape?.edgeDensity ?? null,
+    shape_vertical_profile_json: context.shape?.verticalProfile ? safeJsonStringify(context.shape.verticalProfile) : '',
+    shape_horizontal_profile_json: context.shape?.horizontalProfile ? safeJsonStringify(context.shape.horizontalProfile) : ''
+  };
+
   try {
     await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points?wait=true', {
       method: 'PUT',
       body: JSON.stringify({
-        points: [
-          {
-            id: toPointId(body.recordId),
-            vector,
-            payload: {
-              tenant_id: body.tenantId || 'default',
-              record_id: String(body.recordId),
-              app_id: body.appId ? String(body.appId) : '',
-              drawing_no: context.extracted?.drawingNo || body.drawingNo || '',
-              product_name: context.extracted?.productName || body.productName || '',
-              part_name: context.extracted?.productName || body.productName || '',
-              file_name: body.fileName || '',
-              file_key: body.fileKey || '',
-              indexed_at: new Date().toISOString(),
-              ocr_engine: context.ocr?.engine || 'none',
-              ocr_langs: context.ocr?.langs || '',
-              ocr_text: context.ocr?.text || '',
-              ocr_drawing_no: context.extracted?.drawingNo || '',
-              ocr_product_name: context.extracted?.productName || '',
-              ocr_material: context.extracted?.material || '',
-              ocr_thickness: context.extracted?.thickness || '',
-              ocr_customer: context.extracted?.customer || '',
-              ocr_revision: context.extracted?.revision || '',
-              ocr_shape_category: context.extracted?.shapeCategory || '',
-              ocr_extraction_confidence: context.extracted?.extractionConfidence ?? null,
-              shape_engine: context.shape?.engine || 'none',
-              shape_mode: context.shape?.mode || 'none',
-              shape_image_mode: shapeImageMode,
-              shape_roi_json: context.shape?.cropBox ? safeJsonStringify(context.shape.cropBox) : '',
-              shape_width: context.shape?.width ?? null,
-              shape_height: context.shape?.height ?? null,
-              shape_source_width: context.shape?.sourceWidth ?? null,
-              shape_source_height: context.shape?.sourceHeight ?? null,
-              shape_profile_json: context.shape ? safeJsonStringify(context.shape) : '',
-              shape_bbox_json: context.shape?.bbox ? safeJsonStringify(context.shape.bbox) : '',
-              shape_bbox_aspect_ratio: context.shape?.bboxAspectRatio ?? null,
-              shape_bbox_area_ratio: context.shape?.bboxAreaRatio ?? null,
-              shape_ink_ratio: context.shape?.inkRatio ?? null,
-              shape_centroid_x: context.shape?.centroidX ?? null,
-              shape_centroid_y: context.shape?.centroidY ?? null,
-              shape_edge_density: context.shape?.edgeDensity ?? null,
-              shape_vertical_profile_json: context.shape?.verticalProfile ? safeJsonStringify(context.shape.verticalProfile) : '',
-              shape_horizontal_profile_json: context.shape?.horizontalProfile ? safeJsonStringify(context.shape.horizontalProfile) : '',
-              embedding_provider: embedding.provider,
-              embedding_model: embedding.model || '',
-              embedding_pretrained: embedding.pretrained || '',
-              embedding_image_mode: embedding.imageMode || embeddingImageMode,
-              embedding_vector_size: vector.length
-            }
+        points: embeddings.map((entry) => ({
+          id: toPointIdWithRotation(body.recordId, entry.rotation || 0),
+          vector: entry.vector,
+          payload: {
+            ...basePayload,
+            embedding_provider: entry.provider,
+            embedding_model: entry.model || '',
+            embedding_pretrained: entry.pretrained || '',
+            embedding_image_mode: entry.imageMode || embeddingImageMode,
+            embedding_rotation: Number(entry.rotation || 0),
+            embedding_rotations: embeddingRotations.join(','),
+            embedding_vector_size: entry.vector.length
           }
-        ]
+        }))
       })
     });
   } catch (error) {
     throw attachStep(error, 'qdrant_upsert');
   }
   if (context.log) {
-    context.log('qdrant upsert done', { collection: qdrantCollection, recordId: body.recordId });
+    context.log('qdrant upsert done', { collection: qdrantCollection, recordId: body.recordId, points: embeddings.length });
   }
 
   return {
     configured: true,
     upserted: true,
     collection: qdrantCollection,
-    vectorSize: vector.length
+    vectorSize: firstVector.length,
+    points: embeddings.length,
+    rotations: embeddings.map((entry) => Number(entry.rotation || 0))
   };
 };
 
@@ -1276,36 +1301,49 @@ const getIndexedDrawingVector = async (body) => {
   }
 
   try {
+    const ids = embeddingRotations.map((rotation) => toPointIdWithRotation(body.recordId, rotation));
     const data = await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points', {
       method: 'POST',
       body: JSON.stringify({
-        ids: [toPointId(body.recordId)],
+        ids,
         with_payload: true,
         with_vector: true
       })
     });
-    const point = Array.isArray(data.result) ? data.result[0] : null;
-    if (!point) {
+    const points = Array.isArray(data.result) ? data.result : [];
+    if (!points.length) {
       return null;
     }
 
-    const payload = point.payload || {};
-    if (String(payload.tenant_id || 'default') !== String(body.tenantId || 'default')) {
-      return null;
-    }
-    if (body.appId && payload.app_id && String(payload.app_id) !== String(body.appId)) {
-      return null;
+    const vectors = [];
+    let selectedPayload = null;
+    let selectedPointId = null;
+    for (const point of points) {
+      const payload = point.payload || {};
+      if (String(payload.tenant_id || 'default') !== String(body.tenantId || 'default')) {
+        continue;
+      }
+      if (body.appId && payload.app_id && String(payload.app_id) !== String(body.appId)) {
+        continue;
+      }
+      const pointVector = getPointVector(point);
+      if (!Array.isArray(pointVector) || !pointVector.length) {
+        continue;
+      }
+      vectors.push(pointVector);
+      selectedPayload = selectedPayload || payload;
+      selectedPointId = selectedPointId || point.id;
     }
 
-    const vector = getPointVector(point);
-    if (!Array.isArray(vector) || !vector.length) {
+    if (!vectors.length) {
       return null;
     }
 
     return {
-      pointId: point.id,
-      payload,
-      vector
+      pointId: selectedPointId,
+      payload: selectedPayload || {},
+      vector: vectors.length === 1 ? vectors[0] : vectors,
+      vectors
     };
   } catch (error) {
     if (error.status === 404) {
@@ -1320,29 +1358,45 @@ const searchDrawings = async (body, vector, queryProfile = {}) => {
     return null;
   }
 
-  await ensureCollection(vector.length);
-  const limit = Math.min(Number(body.limit || 10) + 1, 25);
-  const data = await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points/search', {
-    method: 'POST',
-    body: JSON.stringify({
-      vector,
-      limit,
-      with_payload: true,
-      filter: {
-        must: [
-          {
-            key: 'tenant_id',
-            match: {
-              value: body.tenantId || 'default'
-            }
-          }
-        ]
-      }
-    })
-  });
+  const queryVectors = Array.isArray(vector) && Array.isArray(vector[0]) ? vector : [vector];
+  await ensureCollection(queryVectors[0].length);
+  const limit = Math.min((Number(body.limit || 10) + 1) * Math.max(1, queryVectors.length) * 4, 100);
+  const byRecord = new Map();
 
-  return (data.result || [])
-    .filter((item) => String(item.payload?.record_id || '') !== String(body.recordId || ''))
+  for (const queryVector of queryVectors) {
+    const data = await qdrantRequest('/collections/' + encodeURIComponent(qdrantCollection) + '/points/search', {
+      method: 'POST',
+      body: JSON.stringify({
+        vector: queryVector,
+        limit,
+        with_payload: true,
+        filter: {
+          must: [
+            {
+              key: 'tenant_id',
+              match: {
+                value: body.tenantId || 'default'
+              }
+            }
+          ]
+        }
+      })
+    });
+
+    for (const item of data.result || []) {
+      const payload = item.payload || {};
+      if (String(payload.record_id || '') === String(body.recordId || '')) {
+        continue;
+      }
+      const key = String(payload.record_id || item.id);
+      const existing = byRecord.get(key);
+      if (!existing || Number(item.score || 0) > Number(existing.score || 0)) {
+        byRecord.set(key, item);
+      }
+    }
+  }
+
+  return Array.from(byRecord.values())
     .map((item) => {
       const payload = item.payload || {};
       const scored = scoreCandidate({
@@ -1360,6 +1414,7 @@ const searchDrawings = async (body, vector, queryProfile = {}) => {
         shapeCategory: payload.ocr_shape_category || '',
         ocrText: payload.ocr_text || '',
         shape: normalizeShapeProfile(payload.shape_profile_json || payload.shape_profile || null),
+        embeddingRotation: payload.embedding_rotation ?? null,
         score: scored.score,
         scoreBreakdown: scored.scoreBreakdown,
         shapeScoreBreakdown: scored.shapeScoreBreakdown,
@@ -1499,8 +1554,14 @@ const server = createServer(async (request, response) => {
           const { pngBuffer } = await loadRecordImage(body);
           const shape = await buildShapeProfile(pngBuffer);
           queryProfile.shape = shape;
-          embedding = await buildEmbedding(pngBuffer);
-          vector = embedding.vector;
+          const queryEmbeddings = [];
+          for (const rotation of embeddingRotations) {
+            const queryEmbedding = await buildEmbedding(pngBuffer, { rotation });
+            queryEmbedding.rotation = rotation;
+            queryEmbeddings.push(queryEmbedding);
+          }
+          embedding = queryEmbeddings[0];
+          vector = queryEmbeddings.map((entry) => entry.vector);
           queryVectorSource = 'rendered-pdf';
         }
 
@@ -1523,7 +1584,8 @@ const server = createServer(async (request, response) => {
             },
             qdrant: {
               collection: qdrantCollection,
-              vectorSize: vector.length,
+              vectorSize: Array.isArray(vector[0]) ? vector[0].length : vector.length,
+              queryRotations: embeddingRotations,
               queryVectorSource,
               queryPointId: indexed?.pointId || null
             },
@@ -1667,20 +1729,29 @@ const server = createServer(async (request, response) => {
         provider: embeddingProvider,
         imageMode: embeddingImageMode
       });
-      const embedding = await buildEmbedding(pngBuffer, {
-        log: indexLog,
-        errorLog: indexError
-      }).catch((error) => {
-        throw attachStep(error, step);
-      });
+      const embeddings = [];
+      for (const rotation of embeddingRotations) {
+        indexLog('embedding rotation start', { rotation });
+        const entry = await buildEmbedding(pngBuffer, {
+          log: indexLog,
+          errorLog: indexError,
+          rotation
+        }).catch((error) => {
+          throw attachStep(error, step);
+        });
+        entry.rotation = rotation;
+        embeddings.push(entry);
+      }
+      const embedding = embeddings[0];
       indexLog('embedding done', {
         dimension: embedding.vector.length,
         provider: embedding.provider,
-        imageMode: embedding.imageMode || embeddingImageMode
+        imageMode: embedding.imageMode || embeddingImageMode,
+        rotations: embeddings.map((entry) => entry.rotation).join(',')
       });
 
       step = 'qdrant_upsert';
-      const qdrant = await upsertDrawing(body, embedding, {
+      const qdrant = await upsertDrawing(body, embeddings, {
         log: indexLog,
         errorLog: indexError,
         ocr,
@@ -1750,7 +1821,8 @@ const server = createServer(async (request, response) => {
           device: embedding.device || '',
           imageMode: embedding.imageMode || embeddingImageMode,
           image: embedding.image || null,
-          size: embedding.vector.length
+          size: embedding.vector.length,
+          rotations: embeddings.map((entry) => entry.rotation)
         },
         qdrant,
         next: qdrant.upserted

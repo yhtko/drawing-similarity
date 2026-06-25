@@ -54,7 +54,7 @@ VECTOR_SIZE=384
 EMBEDDING_ENDPOINT=http://127.0.0.1:9090
 ```
 
-Start with 10-20 known drawing pairs before re-indexing a larger set. DINOv2 uses the same `EMBED_IMAGE_MODE` preprocessing path as OpenCLIP.
+Start with 10-20 known drawing pairs before re-indexing a larger set. DINOv2 uses the same `EMBED_IMAGE_MODE` preprocessing path as OpenCLIP. To reduce sensitivity to portrait/landscape registration differences, index two rotations during evaluation:`n`n```sh`nEMBED_ROTATIONS=0,90`n```
 
 OCR is enabled by default in production:
 
