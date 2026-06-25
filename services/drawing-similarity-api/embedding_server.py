@@ -1,13 +1,13 @@
 import base64
 import json
 import os
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 
 import open_clip
 import torch
 import torch.nn.functional as functional
-from transformers import AutoImageProcessor, AutoModel
 
 from embed_openclip import choose_device, prepare_image
 
@@ -18,6 +18,9 @@ PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "openclip").strip().lower()
 OPENCLIP_MODEL = os.environ.get("OPENCLIP_MODEL", "ViT-B-32")
 OPENCLIP_PRETRAINED = os.environ.get("OPENCLIP_PRETRAINED", "laion2b_s34b_b79k")
 DINO_MODEL = os.environ.get("DINO_MODEL", "facebook/dinov2-small")
+
+_STATE = None
+_STATE_LOCK = threading.Lock()
 
 
 def json_response(handler, status, payload):
@@ -57,6 +60,8 @@ class EmbeddingState:
         print(json.dumps({"event": "embedding_model_load_done", "provider": "openclip", "device": self.device}), flush=True)
 
     def load_dinov2(self):
+        from transformers import AutoImageProcessor, AutoModel
+
         self.model_name = DINO_MODEL
         self.pretrained = ""
         print(json.dumps({
@@ -82,14 +87,14 @@ class EmbeddingState:
             else:
                 os.environ["EMBED_IMAGE_MODE"] = previous_mode
 
-    def embed_openclip(self, image, image_info):
+    def embed_openclip(self, image):
         tensor = self.preprocess(image).unsqueeze(0).to(self.device)
         with torch.inference_mode():
             features = self.model.encode_image(tensor)
             features = features / features.norm(dim=-1, keepdim=True)
         return features.squeeze(0).detach().cpu().tolist()
 
-    def embed_dinov2(self, image, image_info):
+    def embed_dinov2(self, image):
         inputs = self.processor(images=image, return_tensors="pt")
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         with torch.inference_mode():
@@ -101,9 +106,9 @@ class EmbeddingState:
     def embed(self, image_bytes, image_mode):
         image, image_info = self.prepare_input_image(image_bytes, image_mode)
         if self.provider == "openclip":
-            vector = self.embed_openclip(image, image_info)
+            vector = self.embed_openclip(image)
         else:
-            vector = self.embed_dinov2(image, image_info)
+            vector = self.embed_dinov2(image)
 
         return {
             "provider": self.provider,
@@ -117,7 +122,14 @@ class EmbeddingState:
         }
 
 
-STATE = EmbeddingState()
+def get_state():
+    global _STATE
+    if _STATE is not None:
+        return _STATE
+    with _STATE_LOCK:
+        if _STATE is None:
+            _STATE = EmbeddingState()
+        return _STATE
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -126,12 +138,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            state = _STATE
             json_response(self, 200, {
                 "ok": True,
-                "provider": STATE.provider,
-                "model": STATE.model_name,
-                "pretrained": STATE.pretrained,
-                "device": STATE.device,
+                "loaded": state is not None,
+                "provider": PROVIDER,
+                "model": state.model_name if state else (DINO_MODEL if PROVIDER == "dinov2" else OPENCLIP_MODEL),
+                "pretrained": state.pretrained if state else ("" if PROVIDER == "dinov2" else OPENCLIP_PRETRAINED),
+                "device": state.device if state else os.environ.get("OPENCLIP_DEVICE", "auto"),
             })
             return
         json_response(self, 404, {"ok": False, "error": "not found"})
@@ -146,16 +160,16 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             image_bytes = base64.b64decode(payload.get("image_base64", ""), validate=True)
             image_mode = str(payload.get("image_mode") or os.environ.get("EMBED_IMAGE_MODE", "full")).lower()
-            result = STATE.embed(image_bytes, image_mode)
+            result = get_state().embed(image_bytes, image_mode)
             json_response(self, 200, result)
         except Exception as exc:
-            print(json.dumps({"event": "embedding_error", "error": str(exc)}), flush=True)
-            json_response(self, 500, {"ok": False, "error": str(exc)})
+            print(json.dumps({"event": "embedding_error", "provider": PROVIDER, "error": str(exc)}), flush=True)
+            json_response(self, 500, {"ok": False, "error": str(exc), "provider": PROVIDER})
 
 
 def main():
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(json.dumps({"event": "embedding_server_listening", "host": HOST, "port": PORT}), flush=True)
+    print(json.dumps({"event": "embedding_server_listening", "host": HOST, "port": PORT, "provider": PROVIDER}), flush=True)
     server.serve_forever()
 
 
