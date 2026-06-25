@@ -415,7 +415,8 @@ const buildOpenClipVectorViaEndpoint = async (buffer, context = {}) => {
         },
         body: JSON.stringify({
           image_base64: buffer.toString('base64'),
-          image_mode: embeddingImageMode
+          image_mode: embeddingImageMode,
+          rotation: Number(context.rotation || 0)
         }),
         signal: controller.signal
       });
