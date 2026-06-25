@@ -43,6 +43,19 @@ EMBED_IMAGE_MODE=auto_roi
 VECTOR_SIZE=512
 ```
 
+
+DINOv2 can be tested as an alternate embedding provider. Use a separate Qdrant collection because the vector distribution differs from OpenCLIP:
+
+```sh
+EMBEDDING_PROVIDER=dinov2
+DINO_MODEL=facebook/dinov2-small
+QDRANT_COLLECTION=drawing_similarity_dinov2
+VECTOR_SIZE=384
+EMBEDDING_ENDPOINT=http://127.0.0.1:9090
+```
+
+Start with 10-20 known drawing pairs before re-indexing a larger set. DINOv2 uses the same `EMBED_IMAGE_MODE` preprocessing path as OpenCLIP.
+
 OCR is enabled by default in production:
 
 ```sh

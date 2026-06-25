@@ -14,7 +14,8 @@ const qdrantApiKey = process.env.QDRANT_API_KEY || '';
 const defaultEmbeddingProvider = process.env.NODE_ENV === 'production' ? 'openclip' : 'dummy';
 const embeddingProvider = String(process.env.EMBEDDING_PROVIDER || defaultEmbeddingProvider).toLowerCase();
 const qdrantCollection = process.env.QDRANT_COLLECTION || (
-  embeddingProvider === 'openclip' ? 'drawing_similarity_openclip' : 'drawing_similarity'
+  embeddingProvider === 'dinov2' ? 'drawing_similarity_dinov2' :
+    embeddingProvider === 'openclip' ? 'drawing_similarity_openclip' : 'drawing_similarity'
 );
 const defaultVectorSize = embeddingProvider === 'openclip' ? 512 : 384;
 const expectedVectorSize = Number(process.env.VECTOR_SIZE || defaultVectorSize);
@@ -139,6 +140,10 @@ const getRuntimeInfo = () => ({
   openclip: {
     model: process.env.OPENCLIP_MODEL || 'ViT-B-32',
     pretrained: process.env.OPENCLIP_PRETRAINED || 'laion2b_s34b_b79k',
+    device: process.env.OPENCLIP_DEVICE || 'auto'
+  },
+  dinov2: {
+    model: process.env.DINO_MODEL || 'facebook/dinov2-small',
     device: process.env.OPENCLIP_DEVICE || 'auto'
   },
   renderDpi
@@ -995,7 +1000,12 @@ const buildEmbedding = async (buffer, context = {}) => {
     throw error;
   }
 
-  if (embeddingProvider === 'openclip') {
+  if (embeddingProvider === 'openclip' || embeddingProvider === 'dinov2') {
+    if (embeddingProvider === 'dinov2' && !embeddingEndpoint) {
+      const error = new Error('EMBEDDING_PROVIDER=dinov2 requires EMBEDDING_ENDPOINT');
+      error.status = 500;
+      throw error;
+    }
     return assertEmbeddingVector(await buildOpenClipVector(buffer, context));
   }
 
