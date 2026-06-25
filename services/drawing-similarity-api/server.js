@@ -1438,6 +1438,8 @@ const searchDrawings = async (body, vector, queryProfile = {}) => {
         shapeCategory: payload.ocr_shape_category || '',
         ocrText: payload.ocr_text || '',
         shape: normalizeShapeProfile(payload.shape_profile_json || payload.shape_profile || null),
+        vectorRaw: scored.scoreBreakdown.vectorRaw,
+        vectorScore: scored.scoreBreakdown.vector,
         embeddingRotation: entry.candidateRotation ?? payload.embedding_rotation ?? null,
         embeddingImage: (() => { try { return payload.embedding_image_json ? JSON.parse(payload.embedding_image_json) : null; } catch { return null; } })(),
         queryEmbeddingRotation: entry.queryRotation ?? null,
@@ -1454,6 +1456,23 @@ const searchDrawings = async (body, vector, queryProfile = {}) => {
     .slice(0, Math.min(Number(body.limit || 10), 10));
 };
 
+const buildMatchConfidence = (results = []) => {
+  const topScore = Number(results[0]?.scoreBreakdown?.vectorRaw || 0);
+  const secondScore = Number(results[1]?.scoreBreakdown?.vectorRaw || 0);
+  const margin = Number(Math.max(0, topScore - secondScore).toFixed(4));
+  let level = 'low';
+  if (topScore >= 0.9 && margin >= 0.03) {
+    level = 'high';
+  } else if (topScore >= 0.87 && margin >= 0.015) {
+    level = 'medium';
+  }
+  return {
+    level,
+    topScore: Number(topScore.toFixed(4)),
+    secondScore: Number(secondScore.toFixed(4)),
+    margin
+  };
+};
 const assertKintoneConfig = () => {
   const missing = [];
   if (!kintoneBaseUrl) {
@@ -1596,6 +1615,7 @@ const server = createServer(async (request, response) => {
 
         if (vector) {
           const results = await searchDrawings(body, vector, queryProfile);
+          const matchConfidence = buildMatchConfidence(results || []);
           sendJson(response, 200, {
             mode: indexed ? 'qdrant-indexed' : 'qdrant-' + embedding.provider,
             query: {
@@ -1618,6 +1638,7 @@ const server = createServer(async (request, response) => {
               queryVectorSource,
               queryPointId: indexed?.pointId || null
             },
+            matchConfidence,
             extracted: indexed?.payload ? {
               drawingNo: indexed.payload.ocr_drawing_no || indexed.payload.drawing_no || '',
               productName: indexed.payload.ocr_product_name || indexed.payload.product_name || '',
