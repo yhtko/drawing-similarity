@@ -1272,6 +1272,7 @@ const upsertDrawing = async (body, embedding, context = {}) => {
             embedding_pretrained: entry.pretrained || '',
             embedding_image_mode: entry.imageMode || embeddingImageMode,
             embedding_rotation: Number(entry.rotation || 0),
+            embedding_image_json: entry.image ? safeJsonStringify(entry.image) : '',
             embedding_rotations: embeddingRotations.join(','),
             embedding_vector_size: entry.vector.length
           }
@@ -1437,6 +1438,7 @@ const searchDrawings = async (body, vector, queryProfile = {}) => {
         ocrText: payload.ocr_text || '',
         shape: normalizeShapeProfile(payload.shape_profile_json || payload.shape_profile || null),
         embeddingRotation: entry.candidateRotation ?? payload.embedding_rotation ?? null,
+        embeddingImage: (() => { try { return payload.embedding_image_json ? JSON.parse(payload.embedding_image_json) : null; } catch { return null; } })(),
         queryEmbeddingRotation: entry.queryRotation ?? null,
         rotationScores: entry.rotationScores
           .sort((a, b) => b.vectorRaw - a.vectorRaw)
@@ -1848,7 +1850,8 @@ const server = createServer(async (request, response) => {
           imageMode: embedding.imageMode || embeddingImageMode,
           image: embedding.image || null,
           size: embedding.vector.length,
-          rotations: embeddings.map((entry) => entry.rotation)
+          rotations: embeddings.map((entry) => entry.rotation),
+          images: embeddings.map((entry) => ({ rotation: entry.rotation, image: entry.image || null }))
         },
         qdrant,
         next: qdrant.upserted

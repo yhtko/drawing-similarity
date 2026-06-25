@@ -98,6 +98,8 @@ class EmbeddingState:
         if rotation:
             image = image.rotate(-rotation, expand=True)
         image_info["rotation"] = rotation
+        image_info["rotated_width"] = image.size[0]
+        image_info["rotated_height"] = image.size[1]
 
         if self.provider == "openclip":
             vector = self.embed_openclip(image)
